@@ -1,4 +1,6 @@
-# CryptoBR Social Intelligence
+# SMILE-Social-Media-Intelligence-Listening-Engine
+
+Repositorio criado para o teste tecnico da CryptoBR
 
 Protótipo local e reproduzível para o desafio técnico. O plano em
 [`Plano_CryptoBR_Social_Intelligence.md`](Plano_CryptoBR_Social_Intelligence.md)
