@@ -137,6 +137,13 @@ class Repository:
         ).fetchone()
 
     def start_run(self, source_key: str) -> int:
+        # A previous local process may have been interrupted after committing a
+        # page. Preserve its checkpoint and mark the run honestly before retry.
+        self.connection.execute(
+            """UPDATE collection_runs SET finished_at=?, status='interrupted', error='process interrupted before run completion'
+               WHERE source_key=? AND status='running'""",
+            (utc_now().isoformat(), source_key),
+        )
         cursor = self.connection.execute(
             "INSERT INTO collection_runs (source_key, started_at, status) VALUES (?, ?, 'running')",
             (source_key, utc_now().isoformat()),

@@ -152,8 +152,83 @@ class MastodonHashtagFeed:
         }
 
 
+class MastodonHashtagStream:
+    """Bounded SSE stream of new public statuses for one authorized hashtag."""
+    def __init__(self, base_url: str, token: str) -> None:
+        if not base_url or not token:
+            raise ValueError("MASTODON_BASE_URL and MASTODON_TOKEN are required for streaming")
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+
+    def events(self, hashtag: str):
+        tag = hashtag.lstrip("#").strip()
+        url = "%s/api/v1/streaming/hashtag?%s" % (self.base_url, urllib.parse.urlencode({"tag": tag}))
+        request = urllib.request.Request(url, headers={"Accept": "text/event-stream", "Authorization": "Bearer " + self.token})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                for event in parse_sse(response):
+                    if event["event"] == "update":
+                        yield MastodonHashtagFeed._normalize(json.loads(event["data"]))
+        except urllib.error.HTTPError as error:
+            if error.code in (401, 403):
+                raise SourceAccessError("Mastodon stream access denied (%s); token requires read:statuses" % error.code) from error
+            if error.code == 429 or 500 <= error.code <= 599:
+                raise TransientCollectionError("Mastodon stream transient HTTP error %s" % error.code) from error
+            raise RuntimeError("Mastodon stream HTTP error %s" % error.code) from error
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise TransientCollectionError("Mastodon stream transport error") from error
+
+
+def parse_sse(lines):
+    """Parse minimal Server-Sent Events without trusting payload contents."""
+    event = "message"
+    data = []
+    for raw_line in lines:
+        line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+        line = line.rstrip("\r\n")
+        if not line:
+            if data:
+                yield {"event": event, "data": "\n".join(data)}
+            event, data = "message", []
+        elif line.startswith("event:"):
+            event = line[6:].strip()
+        elif line.startswith("data:"):
+            data.append(line[5:].lstrip())
+
+
+def collect_stream(repository: Repository, stream: MastodonHashtagStream, source_key: str, hashtag: str,
+                   max_events: int = 20, max_reconnects: int = 3) -> Dict[str, Any]:
+    """Collect a bounded set of SSE updates while retaining idempotency per post."""
+    run_id = repository.start_run(source_key)
+    received = inserted = reconnects = 0
+    coverage = {"kind": "mastodon_hashtag_stream", "instance": stream.base_url, "hashtag": hashtag}
+    try:
+        while received < max_events and reconnects <= max_reconnects:
+            try:
+                for payload in stream.events(hashtag):
+                    now = datetime.now(timezone.utc)
+                    post = Post.from_feed(payload, now)
+                    inserted += repository.persist_page(source_key, post.post_id, False, [post])
+                    received += 1
+                    coverage["last_event_published_at"] = payload["timestamp"]
+                    if received >= max_events:
+                        break
+                break
+            except TransientCollectionError:
+                reconnects += 1
+                if reconnects > max_reconnects:
+                    raise
+                time.sleep(min(0.25 * (2 ** (reconnects - 1)), 2))
+        repository.finish_run(run_id, "stream_completed", received, inserted, coverage=coverage)
+        return {"status": "stream_completed", "events": received, "inserted": inserted,
+                "post_count": repository.post_count(), "coverage": coverage}
+    except Exception as error:
+        repository.finish_run(run_id, "failed", received, inserted, str(error), coverage)
+        raise
+
+
 def collect_all(repository: Repository, feed: LocalJsonlFeed, source_key: str, query: str = "all", max_retries: int = 3,
-                reopen_exhausted: bool = False) -> Dict[str, Any]:
+                reopen_exhausted: bool = False, max_pages: Optional[int] = None) -> Dict[str, Any]:
     checkpoint = repository.get_checkpoint(source_key)
     if checkpoint and checkpoint["exhausted"] and not reopen_exhausted:
         return {"status": "already_exhausted", "pages": 0, "inserted": 0, "post_count": repository.post_count()}
@@ -191,6 +266,11 @@ def collect_all(repository: Repository, feed: LocalJsonlFeed, source_key: str, q
             coverage = page.coverage
             if page.exhausted:
                 break
+            if max_pages is not None and pages >= max_pages:
+                repository.finish_run(run_id, "partial_page_limit", pages, inserted,
+                                      "page limit reached; resume from checkpoint", coverage)
+                return {"status": "partial_page_limit", "pages": pages, "inserted": inserted,
+                        "post_count": repository.post_count(), "coverage": coverage}
             cursor = page.next_cursor
         repository.finish_run(run_id, "success", pages, inserted, coverage=coverage)
         return {"status": "success", "pages": pages, "inserted": inserted, "post_count": repository.post_count()}

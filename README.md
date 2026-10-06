@@ -59,12 +59,31 @@ representa cobertura global. Defina `MASTODON_BASE_URL` e, se a instância exigi
 `MASTODON_TOKEN`, então execute:
 
 ```bash
-python3 -m app.cli collect --source mastodon --hashtag crypto
+python3 -m app.cli collect --source mastodon --hashtag crypto --max-pages 10
 ```
 
 Erros `401` e `403` param a coleta para correção de acesso; `429`, `5xx` e erros
 de transporte usam o retry limitado. Não há scraping HTML nem tentativa de
 contornar login, rate limits ou políticas da instância.
+
+Por padrão, o Mastodon é limitado a dez páginas por rodada e retorna
+`partial_page_limit` com checkpoint preservado quando há mais dados. A rodada
+seguinte retoma do cursor salvo; o feed local não recebe esse limite por padrão.
+
+### Streaming de hashtag
+
+Para eventos sociais novos em tempo real, use um token de usuário com
+`read:statuses`. A execução é deliberadamente limitada para a demo e reabre a
+conexão até três vezes para falhas transitórias:
+
+```bash
+export MASTODON_BASE_URL='https://sua-instancia.social'
+export MASTODON_TOKEN='...'
+python3 -m app.cli stream --hashtag bitcoin --max-events 20
+```
+
+O stream captura apenas novos posts que a instância conhece durante a conexão;
+não é uma busca histórica nem cobertura global.
 
 ## Limites atuais
 
