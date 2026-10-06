@@ -43,8 +43,16 @@ def _parse_model_json(content: str) -> dict:
         candidate = candidate.rsplit("```", 1)[0].strip()
     try:
         payload = json.loads(candidate)
-    except json.JSONDecodeError as error:
-        raise AgentError("model did not return valid JSON") from error
+    except json.JSONDecodeError:
+        # Compatible models occasionally preface a valid object with one short
+        # sentence. Extract only a decoder-recognized object, never prose.
+        start = candidate.find("{")
+        if start < 0:
+            raise AgentError("model did not return valid JSON")
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(candidate[start:])
+        except json.JSONDecodeError as error:
+            raise AgentError("model did not return valid JSON") from error
     if not isinstance(payload, dict):
         raise AgentError("model response must be a JSON object")
     return payload
@@ -122,8 +130,13 @@ def analyze_topic(repository: Repository, topic: dict) -> dict:
         if not tool_calls:
             payload = _parse_model_json(message.get("content") or "{}")
             allowed = {"HIGHLIGHT", "MONITOR", "DISCARD"}
-            if payload.get("recommendation") not in allowed:
-                raise AgentError("invalid model recommendation")
+            recommendation = str(payload.get("recommendation", "")).strip().upper()
+            if recommendation not in allowed:
+                # The model may be useful for the explanation yet fail the
+                # enum contract. Host policy chooses the conservative outcome.
+                recommendation = "MONITOR"
+                payload.setdefault("risk_flags", []).append("invalid_model_recommendation_limited_to_monitor")
+            payload["recommendation"] = recommendation
             payload.update({"topic_id": topic["topic_id"], "topic": topic["topic"], "analysis_mode": "openrouter"})
             return validate_analysis(repository, topic, _apply_host_limits(payload, topic))
         messages.append(message)
