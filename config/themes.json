@@ -1,0 +1,10 @@
+{
+  "version": "2026-10-06.1",
+  "categories": [
+    {"id": "crypto_web3", "name": "Cripto e Web3", "terms": ["bitcoin", "btc", "ethereum", "eth", "token", "defi", "stablecoin", "blockchain"]},
+    {"id": "investments_markets", "name": "Investimentos e Mercados", "terms": ["etf", "bolsa", "cambio", "juros", "inflacao", "mercado"]},
+    {"id": "politics_regulation", "name": "Politica e Regulacao", "terms": ["regulador", "regulacao", "tributacao", "fiscalizacao", "comissao"]},
+    {"id": "business_finance", "name": "Empresas e Financas", "terms": ["exchange", "banco", "fintech", "captacao", "aquisicao", "pagamentos"]},
+    {"id": "sports_entertainment", "name": "Esportes e Entretenimento", "terms": ["fan token", "nft", "patrocinio", "clube", "liga"]}
+  ]
+}
