@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+from email.utils import parsedate_to_datetime
 import os
 import time
 import urllib.error
@@ -18,7 +20,9 @@ from app.repository import Repository
 
 
 class TransientCollectionError(RuntimeError):
-    pass
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class SourceAccessError(RuntimeError):
@@ -95,7 +99,24 @@ class LocalJsonlFeed:
         self.path = Path(path)
         self.page_size = page_size
         self.fail_on_page = fail_on_page
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
         self._failed_once = False
+
+    def prefix_hash(self, cursor):
+        digest = hashlib.sha256()
+        count = 0
+        with self.path.open("rb") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                if count >= int(cursor or 0):
+                    break
+                digest.update(line)
+                count += 1
+        if count != int(cursor or 0):
+            raise ValueError("local feed shrank since checkpoint")
+        return digest.hexdigest()
 
     def fetch_page(self, query: str, cursor: Optional[str]) -> Page:
         start = int(cursor or 0)
@@ -111,10 +132,22 @@ class LocalJsonlFeed:
         # Retain the numeric position even at exhaustion. If a later source poll
         # exposes newly appended records, the collector can continue safely.
         timestamps = [record.get("timestamp") for record in records if record.get("timestamp")]
-        return Page(items, str(end), exhausted,
-                    {"kind": "synthetic_local_jsonl", "total_available": len(records), "query": query,
-                     "earliest_published_at": min(timestamps) if timestamps else None,
-                     "latest_published_at": max(timestamps) if timestamps else None})
+        coverage = {"kind": "synthetic_local_jsonl", "total_available": len(records), "query": query,
+                    "earliest_published_at": min(timestamps) if timestamps else None,
+                    "latest_published_at": max(timestamps) if timestamps else None, "complete": False}
+        manifest_path = Path(str(self.path) + ".meta.json")
+        if manifest_path.exists():
+            metadata = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if metadata.get("sha256") != hashlib.sha256(self.path.read_bytes()).hexdigest():
+                raise ValueError("fixture hash differs from its coverage manifest")
+            if metadata.get("kind") != "synthetic_fixture" or not all(row.get("is_synthetic") is True and row.get("platform") == "synthetic" for row in records):
+                raise ValueError("complete coverage is allowed only for labelled synthetic fixtures")
+            left = Post.from_feed({"post_id":"coverage", "platform":"synthetic", "timestamp":metadata["complete_start"], "content":"coverage", "author_id":"fixture"}, datetime.now(timezone.utc)).timestamp
+            right = Post.from_feed({"post_id":"coverage", "platform":"synthetic", "timestamp":metadata["complete_end"], "content":"coverage", "author_id":"fixture"}, datetime.now(timezone.utc)).timestamp
+            if left >= right:
+                raise ValueError("invalid coverage interval")
+            coverage.update({"complete_start": metadata["complete_start"], "complete_end": metadata["complete_end"], "complete": exhausted})
+        return Page(items, str(end), exhausted, coverage)
 
 
 class MastodonHashtagFeed:
@@ -126,6 +159,9 @@ class MastodonHashtagFeed:
     def __init__(self, base_url: str, token: Optional[str] = None, limit: int = 40) -> None:
         if not base_url:
             raise ValueError("MASTODON_BASE_URL is required for the Mastodon connector")
+        parsed = urllib.parse.urlparse(base_url)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+            raise ValueError("Mastodon instance must be an HTTPS URL without credentials")
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.limit = min(max(limit, 1), 40)
@@ -152,16 +188,26 @@ class MastodonHashtagFeed:
             if error.code in (401, 403):
                 raise SourceAccessError("Mastodon access denied (%s); check instance policy or token" % error.code) from error
             if error.code == 429 or 500 <= error.code <= 599:
-                raise TransientCollectionError("Mastodon transient HTTP error %s" % error.code) from error
+                retry_after = None
+                raw = error.headers.get("Retry-After") if error.headers else None
+                if raw:
+                    try:
+                        retry_after = max(0, float(raw))
+                    except ValueError:
+                        try:
+                            retry_after = max(0, (parsedate_to_datetime(raw) - datetime.now(timezone.utc)).total_seconds())
+                        except (ValueError, TypeError):
+                            retry_after = 30
+                raise TransientCollectionError("Mastodon transient HTTP error %s" % error.code, retry_after) from error
             raise RuntimeError("Mastodon HTTP error %s" % error.code) from error
         except (urllib.error.URLError, TimeoutError) as error:
             raise TransientCollectionError("Mastodon transport error") from error
         next_cursor = self._next_cursor(link_header)
-        items = [self._normalize(status) for status in statuses]
+        items = [self._normalize(status, self.base_url) for status in statuses]
         exhausted = not bool(next_cursor)
         timestamps = [item["timestamp"] for item in items]
         return Page(items, next_cursor, exhausted, {
-            "kind": "mastodon_hashtag", "instance": self.base_url, "hashtag": hashtag,
+            "kind": "mastodon_hashtag", "instance": self.base_url, "hashtag": hashtag, "complete": False,
             "returned_items": len(items), "earliest_published_at": min(timestamps) if timestamps else None,
             "latest_published_at": max(timestamps) if timestamps else None,
         })
@@ -180,12 +226,13 @@ class MastodonHashtagFeed:
         return None
 
     @staticmethod
-    def _normalize(status: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize(status: Dict[str, Any], instance: Optional[str] = None) -> Dict[str, Any]:
         account = status.get("account") or {}
+        namespace = urllib.parse.urlparse(instance).netloc.casefold() + ":" if instance else ""
         return {
-            "post_id": str(status["id"]), "platform": "mastodon",
+            "post_id": namespace + str(status["id"]), "platform": "mastodon",
             "timestamp": status["created_at"], "content": strip_html(status.get("content", "")),
-            "author_id": "mastodon:%s" % account.get("id", "unknown"),
+            "author_id": "mastodon:%s%s" % (namespace, account.get("id", "unknown")),
             "source_url": status.get("url") or status.get("uri") or "mastodon://" + str(status["id"]),
             "canonical_uri": status.get("uri"), "repost_of": str(status["reblog"]["id"]) if status.get("reblog") else None,
             "likes": status.get("favourites_count"), "comments": status.get("replies_count"),
@@ -198,6 +245,9 @@ class MastodonHashtagStream:
     def __init__(self, base_url: str, token: Optional[str] = None) -> None:
         if not base_url:
             raise ValueError("MASTODON_BASE_URL is required for streaming")
+        parsed = urllib.parse.urlparse(base_url)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+            raise ValueError("Mastodon instance must be an HTTPS URL without credentials")
         self.base_url = base_url.rstrip("/")
         self.token = token
 
@@ -212,7 +262,7 @@ class MastodonHashtagStream:
             with urllib.request.urlopen(request, timeout=30) as response:
                 for event in parse_sse(response):
                     if event["event"] == "update":
-                        yield MastodonHashtagFeed._normalize(json.loads(event["data"]))
+                        yield MastodonHashtagFeed._normalize(json.loads(event["data"]), self.base_url)
         except urllib.error.HTTPError as error:
             if error.code in (401, 403):
                 mode = "credential" if self.token else "public stream"
@@ -299,7 +349,7 @@ def collect_stream(repository: Repository, stream: MastodonHashtagStream, source
     """Collect a bounded set of SSE updates while retaining idempotency per post."""
     run_id = repository.start_run(source_key)
     received = inserted = reconnects = 0
-    coverage = {"kind": "mastodon_hashtag_stream", "instance": stream.base_url, "hashtag": hashtag}
+    coverage = {"kind": "mastodon_hashtag_stream", "instance": stream.base_url, "hashtag": hashtag, "complete": False}
     try:
         while received < max_events and reconnects <= max_reconnects:
             try:
@@ -327,13 +377,20 @@ def collect_stream(repository: Repository, stream: MastodonHashtagStream, source
 
 def collect_all(repository: Repository, feed: LocalJsonlFeed, source_key: str, query: str = "all", max_retries: int = 3,
                 reopen_exhausted: bool = False, max_pages: Optional[int] = None) -> Dict[str, Any]:
+    if max_retries <= 0 or (max_pages is not None and max_pages <= 0):
+        raise ValueError("retry/page limits must be positive")
     checkpoint = repository.get_checkpoint(source_key)
+    if isinstance(feed, LocalJsonlFeed) and checkpoint and checkpoint["cursor"] and not checkpoint["prefix_hash"]:
+        raise ValueError("legacy checkpoint has no verified feed prefix; use an isolated source/database")
+    if isinstance(feed, LocalJsonlFeed) and checkpoint and checkpoint["prefix_hash"]:
+        if feed.prefix_hash(checkpoint["cursor"]) != checkpoint["prefix_hash"]:
+            raise ValueError("local feed prefix changed; use an isolated source/database")
     if checkpoint and checkpoint["exhausted"] and not reopen_exhausted:
         return {"status": "already_exhausted", "pages": 0, "inserted": 0, "post_count": repository.post_count()}
     cursor = checkpoint["cursor"] if checkpoint else None
     seen_cursors = set()
     run_id = repository.start_run(source_key)
-    pages = inserted = 0
+    pages = inserted = retries = 0
     coverage = {}
     try:
         while True:
@@ -349,7 +406,11 @@ def collect_all(repository: Repository, feed: LocalJsonlFeed, source_key: str, q
                 except TransientCollectionError as error:
                     last_error = error
                     if attempt + 1 < max_retries:
-                        time.sleep(min(0.05 * (2 ** attempt), 0.2))
+                        retries += 1
+                        delay = error.retry_after
+                        if delay is not None and delay > 30:
+                            raise TransientCollectionError("server requested a wait above the 30-second demo budget; resume later") from error
+                        time.sleep(delay if delay is not None else min(0.5 * (2 ** attempt), 2))
             if page is None:
                 raise last_error or RuntimeError("page fetch failed")
             valid_posts = []
@@ -359,9 +420,17 @@ def collect_all(repository: Repository, feed: LocalJsonlFeed, source_key: str, q
                     valid_posts.append(Post.from_feed(item, now))
                 except (TypeError, ValueError) as error:
                     repository.record_invalid(source_key, cursor, item, str(error))
-            inserted += repository.persist_page(source_key, page.next_cursor, page.exhausted, valid_posts)
+            prefix = feed.prefix_hash(page.next_cursor) if isinstance(feed, LocalJsonlFeed) else None
+            inserted += repository.persist_page(source_key, page.next_cursor, page.exhausted, valid_posts, prefix)
+            if isinstance(feed, MastodonHashtagFeed) and not page.exhausted:
+                time.sleep(1)
             pages += 1
-            coverage = page.coverage
+            coverage = dict(page.coverage)
+            rejected = repository.connection.execute("SELECT COUNT(*) FROM invalid_records WHERE source_key=?", (source_key,)).fetchone()[0]
+            if rejected:
+                coverage["complete"] = False
+                coverage["rejected_records"] = rejected
+            coverage["retry_count"] = retries
             if page.exhausted:
                 break
             if max_pages is not None and pages >= max_pages:
@@ -371,7 +440,8 @@ def collect_all(repository: Repository, feed: LocalJsonlFeed, source_key: str, q
                         "post_count": repository.post_count(), "coverage": coverage}
             cursor = page.next_cursor
         repository.finish_run(run_id, "success", pages, inserted, coverage=coverage)
-        return {"status": "success", "pages": pages, "inserted": inserted, "post_count": repository.post_count()}
+        return {"status": "success", "pages": pages, "inserted": inserted, "post_count": repository.post_count(), "retries": retries, "coverage": coverage}
     except Exception as error:
         repository.finish_run(run_id, "failed", pages, inserted, str(error), coverage)
         raise
+

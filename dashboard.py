@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 import streamlit as st
 
 from app.repository import Repository
+from app.trends import analyze
+from app.agent import analyze_topic
 from app.agent_types import evidence_for_topic
 from app.categories import load_taxonomy
 from app.collectors import MastodonHashtagFeed, SourceAccessError, TransientCollectionError, collect_all
@@ -15,7 +17,7 @@ from app.settings import load_local_env
 # External collection is the product-facing default. The deterministic dataset
 # remains available only when a demo explicitly sets CRYPTOBR_DATABASE.
 load_local_env()
-DATABASE = os.getenv("CRYPTOBR_DATABASE", "data/mastodon_public.sqlite3")
+DATABASE = os.getenv("SMILE_DATABASE") or os.getenv("CRYPTOBR_DATABASE", "data/mastodon_public.sqlite3")
 
 
 def repository():
@@ -32,8 +34,8 @@ def repository():
 
 
 def main():
-    st.set_page_config(page_title="CryptoBR Social Intelligence", layout="wide")
-    st.title("CryptoBR Social Intelligence")
+    st.set_page_config(page_title="SMILE — Social Media Intelligence & Listening Engine", layout="wide")
+    st.title("SMILE — Social Media Intelligence & Listening Engine")
     store = repository()
     profile = store.data_profile()
     total_posts = profile["total_posts"]
@@ -51,7 +53,8 @@ def main():
         st.subheader("Coleta pública")
         hashtag = st.text_input("Hashtag", value="bitcoin", help="Sem #. A coleta usa uma página pública da instância.")
         instance = st.text_input("Instância Mastodon", value=os.getenv("MASTODON_BASE_URL", "https://mastodon.social"))
-        if st.button("Buscar agora", type="primary", use_container_width=True):
+        if st.button("Buscar agora", type="primary", width="stretch", disabled=bool(synthetic_posts)):
+            # Synthetic and external samples must stay in separate databases.
             try:
                 normalized_tag = hashtag.strip().lstrip("#")
                 if not normalized_tag:
@@ -61,9 +64,13 @@ def main():
                 )
                 result = collect_all(store, MastodonHashtagFeed(instance, token=None), source_key,
                                      query=normalized_tag, max_pages=1)
+                now = datetime.now(timezone.utc)
+                for candidate in analyze(store, now):
+                    alert = analyze_topic(store, candidate, allow_llm=False)
+                    store.save_alert(candidate["topic_id"], alert["analysis_mode"], alert["recommendation"], alert)
                 st.success("Busca concluída: %s novos posts." % result["inserted"])
                 st.rerun()
-            except (ValueError, SourceAccessError, TransientCollectionError) as error:
+            except (ValueError, RuntimeError) as error:
                 st.error("Não foi possível coletar a hashtag: " + str(error))
     rows = store.dashboard_topics()
     collection = store.latest_collection_run()
@@ -80,6 +87,7 @@ def main():
             st.warning("A última coleta não terminou normalmente; os dados exibidos podem estar defasados.")
     if not rows:
         st.info("Ainda não há análise. Gere o dataset, colete e execute `python -m app.cli analyze --with-agent`.")
+        store.close()
         return
     categories = ["Todas"] + sorted({row["primary_category"] for row in rows if row["primary_category"]})
     selected = st.sidebar.selectbox("Categoria", categories)
@@ -98,7 +106,11 @@ def main():
                 "Estágio": row["stage"], "Posts": row["post_count"], "Autores": row["author_count"],
                 "HHI": round(row["hhi"], 3) if row["hhi"] is not None else None,
                 "Recomendação": row["recommendation"] or "sem análise"} for row in filtered]
-    st.dataframe(display, use_container_width=True, hide_index=True)
+    st.dataframe(display, width="stretch", hide_index=True)
+    if not filtered:
+        st.info("Nenhum tópico corresponde aos filtros selecionados.")
+        store.close()
+        return
     labels = {row["topic_id"]: row["title"] for row in filtered}
     topic_id = st.selectbox("Ver assunto", list(labels), format_func=labels.get)
     row = next(item for item in filtered if item["topic_id"] == topic_id)
@@ -107,7 +119,9 @@ def main():
     right.metric("Contribuições / baseline", "%s / %s" % (row["capped_contributions"], row["baseline"]))
     third.metric("Autores distintos", row["author_count"])
     st.json({"componentes": json.loads(row["components"]), "modo_de_análise": row["analysis_mode"],
-             "atualizado_em": row["updated_at"]})
+             "atualizado_em": row["updated_at"], "janela": [row["window_start"], row["window_end"]],
+             "versao_metricas": row["metrics_version"], "circulacao": json.loads(row["circulation"] or "{}"),
+             "cobertura": json.loads(row["coverage"] or "[]")})
     taxonomy = load_taxonomy()
     category_ids = [item["id"] for item in taxonomy["categories"]]
     st.subheader("Correção de classificação")
@@ -130,11 +144,11 @@ def main():
                 st.success("Correção registrada; ela prevalece nas próximas análises.")
             except ValueError as error:
                 st.error(str(error))
-    evidence = evidence_for_topic(store, topic_id, 8)
+    evidence = evidence_for_topic(store, topic_id, 8, row["window_start"], row["window_end"], row["metrics_version"])
     if evidence:
         st.subheader("Evidências capturadas")
         for item in evidence:
-            st.write("%s — %s" % (item["post_id"], item["content"]))
+            st.text("%s — %s" % (item["ref"], item["content"]))
             if item["source_url"].startswith(("https://", "http://")):
                 st.link_button("Abrir referência", item["source_url"], key="source-" + item["post_id"])
             else:
@@ -143,6 +157,13 @@ def main():
         alert = json.loads(row["payload"])
         st.subheader("Sugestão automática")
         st.write(alert.get("summary", "Sem resumo."))
+        st.caption("Alerta vinculado à janela e versão exibidas; interpretação do modelo requer revisão.")
+        if alert.get("claims"):
+            st.json({"trechos_observados_e_interpretacoes": alert["claims"]})
+        if alert.get("model_summary"):
+            with st.expander("Interpretação não verificada do modelo"):
+                st.caption("Texto do modelo preservado para auditoria; não representa confirmação factual.")
+                st.text(alert["model_summary"])
         st.caption("Recomendação: %s · modo: %s" % (row["recommendation"], row["analysis_mode"]))
         if alert.get("uncertainties"):
             st.warning("Incertezas: " + "; ".join(alert["uncertainties"]))
@@ -162,10 +183,17 @@ def main():
                     st.error(str(error))
         reviews = store.reviews_for_alert(row["alert_id"])
         if reviews:
-            st.dataframe([dict(item) for item in reviews], use_container_width=True, hide_index=True)
+            newest = reviews[0]
+            status = {"APPROVE":"approved", "REJECT":"rejected", "EDIT":"pending"}[newest["decision"]]
+            st.caption("Estado humano desta versão: " + status)
+            if newest["revised_summary"]:
+                st.write("Resumo revisado: " + newest["revised_summary"])
+            st.dataframe([dict(item) for item in reviews], width="stretch", hide_index=True)
     else:
-        st.info("Ainda não há sugestão automática para este assunto.")
+        st.info("Ainda não há sugestão automática para esta janela e versão.")
+    store.close()
 
 
 if __name__ == "__main__":
     main()
+

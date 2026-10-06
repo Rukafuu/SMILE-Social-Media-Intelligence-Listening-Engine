@@ -32,7 +32,7 @@ class MastodonConnectorTests(unittest.TestCase):
         self.assertFalse(page.exhausted)
         self.assertEqual("41", page.next_cursor)
         self.assertEqual("ETF fictício", page.items[0]["content"])
-        self.assertEqual("mastodon:ana", page.items[0]["author_id"])
+        self.assertEqual("mastodon:example.social:ana", page.items[0]["author_id"])
         self.assertFalse(page.items[0]["is_synthetic"])
 
     def test_html_text_extraction(self):
@@ -41,3 +41,4 @@ class MastodonConnectorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

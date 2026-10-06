@@ -21,10 +21,11 @@ class ValidationTests(unittest.TestCase):
 
         result = validate_analysis(EmptyRepository(), {"topic_id": "topic", "score": 90}, {
             "recommendation": "HIGHLIGHT", "evidence_refs": ["invented"], "risk_flags": [], "uncertainties": []
-        })
+        }, consulted=[])
         self.assertEqual("MONITOR", result["recommendation"])
         self.assertIn("invalid_evidence_reference", result["risk_flags"])
 
 
 if __name__ == "__main__":
     unittest.main()
+

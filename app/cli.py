@@ -26,7 +26,7 @@ from app.trends import analyze
 from app.agent import AgentError, analyze_topic
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="cryptobr")
+    parser = argparse.ArgumentParser(prog="smile")
     subparsers = parser.add_subparsers(dest="command", required=True)
     collect = subparsers.add_parser("collect", help="collect the paged local feed")
     collect.add_argument("--source", choices=["local", "mastodon"], default="local")
@@ -44,6 +44,8 @@ def main() -> None:
     analyze_command.add_argument("--database", default="data/cryptobr.sqlite3")
     analyze_command.add_argument("--as-of", required=True)
     analyze_command.add_argument("--with-agent", action="store_true", help="create bounded analysis suggestions")
+    analyze_command.add_argument("--max-agent-topics", type=int, default=5, help="live LLM budget; other topics use deterministic analysis")
+    analyze_command.add_argument("--retry-agent", action="store_true", help="retry failed cached LLM attempts without replacing prior reviews")
     review = subparsers.add_parser("review", help="record a human decision for an alert")
     review.add_argument("--database", default="data/cryptobr.sqlite3")
     review.add_argument("--alert-id", type=int, required=True)
@@ -100,9 +102,14 @@ def main() -> None:
             moment = datetime.fromisoformat(args.as_of.replace("Z", "+00:00"))
             results = analyze(repository, moment)
             if args.with_agent:
+                if args.max_agent_topics < 0:
+                    parser.error("--max-agent-topics cannot be negative")
+                # Ensure the injection scenario is actually included in the live budget.
+                candidates = sorted(results, key=lambda item: ("prompt_injection_content" in item["circulation"]["risk_flags"], item["score"] or -1), reverse=True)
+                allowed = {item["topic_id"] for item in candidates[:args.max_agent_topics]}
                 for topic in results:
                     try:
-                        alert = analyze_topic(repository, topic)
+                        alert = analyze_topic(repository, topic, retry=args.retry_agent, allow_llm=topic["topic_id"] in allowed)
                     except AgentError as error:
                         alert = {"topic_id": topic["topic_id"], "analysis_mode": "unavailable", "error": str(error), "recommendation": "MONITOR"}
                     topic["agent"] = alert
@@ -195,3 +202,4 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print(json.dumps({"status": "interrupted", "events": 0, "inserted": 0}, ensure_ascii=False))
+

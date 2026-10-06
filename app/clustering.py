@@ -1,6 +1,8 @@
-"""Conservative lexical event association for the synthetic MVP dataset."""
+"""Conservative event rules: entity plus action; no scenario labels as input."""
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Optional
 
@@ -12,34 +14,36 @@ class EventMatch:
     reason: str
 
 
-RULES = (
-    ("token-aurora-protocol", "Token Aurora fictício cresce após anúncio de protocolo", ("token aurora", "protocolo")),
-    ("bitcoin-etf-stable", "Bitcoin permanece estável após sessão de ETFs fictícios", ("bitcoin", "etf")),
-    ("regulator-crypto-etf", "Regulador fictício aprova consulta sobre ETF cripto", ("regulador", "etf")),
-    ("exchange-aurora-listing", "Exchange Aurora anuncia listagem fictícia", ("exchange aurora", "listagem")),
-    ("exchange-aurora-incident", "Exchange Aurora sofre incidente fictício", ("exchange aurora", "incidente")),
-    ("horizonte-crypto-sponsorship", "Clube Horizonte fecha patrocínio cripto fictício", ("clube horizonte", "patrocínio")),
-    ("market-rates-crypto-etf", "Mercado debate juros e ETF cripto fictício", ("mercado", "juros", "etf")),
-    ("novachain-audit-rumor", "Rumor sobre auditoria da NovaChain", ("novachain", "auditoria")),
-    ("old-orbit-announcement", "Anúncio antigo da Orbit recircula", ("orbit", "anúncio antigo")),
-)
-
-
 def normalize_for_family(content: str) -> str:
-    # Families measure copies. Similarity-based near-copy association is added
-    # separately; unique wording about the same event stays a distinct family.
     return " ".join(content.casefold().split())
 
 
+def lexical(content: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", normalize_for_family(content))
+                   if unicodedata.category(c) != "Mn")
+
+
+# Alternative phrases allow paraphrases; action separates events of one entity.
+RULES = (
+    ("token-aurora-protocol", "Token Aurora — anúncio de protocolo", ("token aurora", "aurora token"), ("protocolo", "protocol", "rede", "atualizacao")),
+    ("bitcoin-etf-stable", "Bitcoin — discussão de ETFs", ("bitcoin", "btc"), ("etf", "fundo negociado")),
+    ("regulator-crypto-etf", "Regulador — consulta sobre ETF cripto", ("regulador", "autoridade reguladora"), ("etf", "fundo cripto")),
+    ("exchange-aurora-listing", "Exchange Aurora — listagem", ("exchange aurora", "corretora aurora"), ("listagem", "listar", "negociacao")),
+    ("exchange-aurora-incident", "Exchange Aurora — incidente", ("exchange aurora", "corretora aurora"), ("incidente", "ataque", "invasao", "falha de seguranca")),
+    ("horizonte-crypto-sponsorship", "Clube Horizonte — patrocínio cripto", ("clube horizonte",), ("patrocinio", "patrocinador")),
+    ("market-rates-crypto-etf", "Mercado — juros e ETF cripto", ("mercado",), ("juros",)),
+    ("novachain-audit-rumor", "NovaChain — rumor de auditoria", ("novachain",), ("auditoria", "relatorio de auditor")),
+    ("old-orbit-announcement", "Orbit — anúncio recirculado", ("orbit",), ("anuncio", "comunicado")),
+    ("pumplet-campaign", "Pumplet — campanha de token", ("pumplet",), ("token",)),
+)
+
+
 def match_event(content: str) -> Optional[EventMatch]:
-    normalized = normalize_for_family(content)
-    for topic_id, title, required_terms in RULES:
-        if all(term in normalized for term in required_terms):
-            return EventMatch(topic_id, title, "aliases e ação/objeto compatíveis")
-    # External hashtag samples do not carry the synthetic scenario vocabulary.
-    # Keep the fallback intentionally narrow: it is an observed discussion
-    # cluster, not a claim that every post describes one real-world event.
-    if "bitcoin" in normalized or "#btc" in normalized or " btc " in normalized:
+    text = lexical(content)
+    for topic_id, title, entities, actions in RULES:
+        if any(term in text for term in entities) and any(term in text for term in actions):
+            return EventMatch(topic_id, title, "entidade e ação compatíveis por regras lexicais")
+    if re.search(r"\b(bitcoin|btc)\b", text):
         return EventMatch("external-bitcoin-discussion", "Bitcoin — discussão pública observada",
-                          "agrupamento heurístico externo por entidade; não implica um evento confirmado")
+                          "agrupamento heurístico externo por entidade; não confirma um evento")
     return None

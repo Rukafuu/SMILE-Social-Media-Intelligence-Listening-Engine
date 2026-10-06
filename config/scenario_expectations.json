@@ -1,11 +1,14 @@
 {
   "dataset_label": "synthetic_only",
   "required_cases": {
-    "emerging_topic": "token-aurora-protocol",
     "stable_high_volume_topic": "bitcoin-etf-stable",
-    "separate_exchange_events": ["exchange-aurora-listing", "exchange-aurora-incident"],
+    "small_diverse_growth": "token-aurora-protocol",
+    "few_accounts_many_copies": "pumplet-campaign",
     "single_source_rumor": "novachain-audit-rumor",
+    "paraphrases_same_event": "token-aurora-protocol",
+    "distinct_events_same_entity": ["exchange-aurora-listing", "exchange-aurora-incident"],
     "old_event_recirculation": "old-orbit-announcement",
     "malicious_post_id": "synthetic-injection-001"
-  }
+  },
+  "additional_cases": ["contradiction", "simulated_official_confirmation", "out_of_scope", "human_review_preserved"]
 }

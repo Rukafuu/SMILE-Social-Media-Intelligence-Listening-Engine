@@ -1,19 +1,36 @@
-"""Read-only evidence projection shared by the agent and deterministic critic."""
+"""Immutable evidence of the exact topic/window/version under analysis."""
 from __future__ import annotations
 
-from typing import List
+import json
+from app.clustering import lexical
 
-from app.clustering import match_event
+
+def evidence_priority(item):
+    text = lexical(item["content"])
+    if any(term in text for term in ("ignore instru", "ignore previous", "execute shell", "exfiltrate")):
+        return 0
+    if item.get("source_kind") == "synthetic_official":
+        return 1
+    if any(term in text for term in ("nega ", "contraditor", "desment")):
+        return 2
+    return 3
 
 
-def evidence_for_topic(repository, topic_id: str, limit: int) -> List[dict]:
-    result = []
-    rows = repository.connection.execute("SELECT post_id, platform, timestamp, content, author_id, source_url, cited_source, event_published_at, is_synthetic FROM posts ORDER BY timestamp DESC").fetchall()
-    for row in rows:
-        event = match_event(row["content"])
-        if event and event.topic_id == topic_id:
-            result.append({key: row[key] for key in row.keys()})
-        if len(result) >= limit:
-            break
-    return result
-    
+def evidence_for_topic(repository, topic_id, limit, window_start=None, window_end=None, version=None):
+    if window_start is None:
+        metrics = repository.latest_topic_metrics(topic_id)
+        if not metrics or metrics["metrics_version"] is None:
+            return []
+        window_start, window_end, version = metrics["window_start"], metrics["window_end"], metrics["metrics_version"]
+    snapshot = repository.snapshot(topic_id, window_start, window_end, version)
+    if not snapshot:
+        return []
+    evidence = json.loads(snapshot["evidence"])
+    # Risks and authority must reach the model; then prefer distinct wording.
+    evidence.sort(key=lambda item: (evidence_priority(item), item["timestamp"], item["ref"]))
+    distinct, repeated, seen = [], [], set()
+    for item in evidence:
+        normalized = lexical(item["content"])
+        (repeated if normalized in seen else distinct).append(item)
+        seen.add(normalized)
+    return (distinct + repeated)[:limit]
