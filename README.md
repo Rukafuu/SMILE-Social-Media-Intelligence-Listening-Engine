@@ -81,6 +81,17 @@ uma credencial inválida bloqueie a fonte:
 .venv/bin/python app/cli.py collect --source mastodon --public --hashtag bitcoin --max-pages 1
 ```
 
+Para abrir no painel o banco dessa coleta externa (sem misturá-lo ao dataset de
+demonstração), execute:
+
+```bash
+CRYPTOBR_DATABASE=data/mastodon_public.sqlite3 .venv/bin/streamlit run dashboard.py
+```
+
+Posts externos são exibidos como cobertura limitada da consulta/instância. O
+primeiro agrupamento fora do dataset é deliberadamente estreito (`Bitcoin —
+discussão pública observada`) e heurístico; não é uma confirmação de evento.
+
 Erros `401` e `403` param a coleta para correção de acesso; `429`, `5xx` e erros
 de transporte usam o retry limitado. Não há scraping HTML nem tentativa de
 contornar login, rate limits ou políticas da instância.

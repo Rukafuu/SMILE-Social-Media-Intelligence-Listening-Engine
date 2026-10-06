@@ -30,6 +30,26 @@ TOOLS = [
 ]
 
 
+def _parse_model_json(content: str) -> dict:
+    """Accept a JSON object, optionally wrapped in a Markdown code fence.
+
+    Some compatible free models add a fence despite the response contract. We
+    remove only that presentation wrapper; prose or malformed JSON remains an
+    error and cannot become a host action.
+    """
+    candidate = (content or "").strip()
+    if candidate.startswith("```") and candidate.endswith("```"):
+        candidate = candidate.split("\n", 1)[1] if "\n" in candidate else ""
+        candidate = candidate.rsplit("```", 1)[0].strip()
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError as error:
+        raise AgentError("model did not return valid JSON") from error
+    if not isinstance(payload, dict):
+        raise AgentError("model response must be a JSON object")
+    return payload
+
+
 def _metrics_payload(repository: Repository, topic_id: str) -> dict:
     row = repository.latest_topic_metrics(topic_id)
     if not row:
@@ -100,10 +120,7 @@ def analyze_topic(repository: Repository, topic: dict) -> dict:
         message = response["choices"][0]["message"]
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
-            try:
-                payload = json.loads(message.get("content") or "{}")
-            except json.JSONDecodeError as error:
-                raise AgentError("model did not return valid JSON") from error
+            payload = _parse_model_json(message.get("content") or "{}")
             allowed = {"HIGHLIGHT", "MONITOR", "DISCARD"}
             if payload.get("recommendation") not in allowed:
                 raise AgentError("invalid model recommendation")
