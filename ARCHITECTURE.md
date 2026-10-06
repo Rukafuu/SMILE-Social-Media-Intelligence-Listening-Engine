@@ -121,9 +121,13 @@ Com 1.000 candidatos/dia, esse componente seria dez vezes maior. O orçamento de
 contar o histórico reenviado em cada rodada de ferramenta, não só o texto inicial.
 
 Para dimensionar armazenamento, assuma hipoteticamente 2 KiB normalizados/post:
-aproximadamente 20,5 GB/dia, 614 GB em trinta dias antes de índices, réplicas e backup.
-A US$0,03/GB-mês, somente os 614 GB custariam cerca de US$18,42/mês.
-Filas/workers/banco/tráfego podem ter reserva ilustrativa de US$300/mês, levando a
-US$350,82/mês nesses componentes. Essa reserva não comprova capacidade; coleta e
-licenças de dados, embeddings, observabilidade e suporte estão excluídos. Um orçamento
-real exige medição do tamanho dos posts, candidatos, tokens, retenção, pico e contratos.
+20,48 GB/dia e 614,4 GB em trinta dias (GB decimal), antes de índices, réplicas e backup.
+A US$0,03/GB-mês, esse estoque bruto custaria cerca de US$18,43/mês quando a retenção
+estiver preenchida. Uma reserva arbitrária de US$300/mês para workers/fila/banco/tráfego
+leva ao subtotal ilustrativo de US$350,83/mês com a IA do cenário base.
+Essa reserva não comprova capacidade; coleta/licenças de dados, embeddings,
+observabilidade e suporte não foram precificados. Um orçamento real exige medição
+de tamanho, candidatos, tokens, retenção, pico e contratos.
+
+Veja [COSTS.md](COSTS.md) para três cenários de sensibilidade, premissas/exclusões,
+controles implementados e uma fala de aproximadamente um minuto para a apresentação.

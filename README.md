@@ -225,6 +225,9 @@ python -m unittest discover -s tests -v
 python scripts/run_demo.py --output data/demo-results.json
 ```
 
+A apresentação de custos, com fórmula, três cenários e uma fala curta, está em
+[`COSTS.md`](COSTS.md). Os preços são explicitamente hipotéticos.
+
 Veja [`VALIDATION.md`](VALIDATION.md) para testes, demonstração e limites da evidência,
 e [`ARCHITECTURE.md`](ARCHITECTURE.md) para diagrama, escala de dez milhões de posts/dia,
 custos hipotéticos e evolução de comunidades/narrativas/regiões. O
