@@ -26,6 +26,33 @@ class SourceAccessError(RuntimeError):
     pass
 
 
+def exchange_mastodon_authorization_code(base_url: str, client_id: str, client_secret: str,
+                                         code: str, redirect_uri: str) -> Dict[str, Any]:
+    """Exchange a one-use authorization code for a user access token."""
+    if not all((base_url, client_id, client_secret, code, redirect_uri)):
+        raise ValueError("client ID, client secret, authorization code and redirect URI are required")
+    encoded = urllib.parse.urlencode({"grant_type": "authorization_code", "client_id": client_id,
+                                      "client_secret": client_secret, "code": code,
+                                      "redirect_uri": redirect_uri}).encode("utf-8")
+    request = urllib.request.Request(base_url.rstrip("/") + "/oauth/token", data=encoded, method="POST",
+                                     headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        if error.code in (400, 401):
+            raise SourceAccessError("authorization code exchange rejected; codes are one-use and redirect URI must match") from error
+        raise TransientCollectionError("Mastodon authorization exchange HTTP error %s" % error.code) from error
+    except (urllib.error.URLError, TimeoutError) as error:
+        raise TransientCollectionError("Mastodon authorization exchange transport error") from error
+    if not payload.get("access_token"):
+        raise SourceAccessError("authorization exchange returned no access token")
+    scopes = set(str(payload.get("scope", "")).split())
+    if "read" not in scopes and "read:statuses" not in scopes:
+        raise SourceAccessError("new user token does not include read:statuses")
+    return payload
+
+
 class _TextExtractor(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -153,17 +180,20 @@ class MastodonHashtagFeed:
 
 
 class MastodonHashtagStream:
-    """Bounded SSE stream of new public statuses for one authorized hashtag."""
-    def __init__(self, base_url: str, token: str) -> None:
-        if not base_url or not token:
-            raise ValueError("MASTODON_BASE_URL and MASTODON_TOKEN are required for streaming")
+    """Bounded SSE stream of public hashtag events, with optional credentials."""
+    def __init__(self, base_url: str, token: Optional[str] = None) -> None:
+        if not base_url:
+            raise ValueError("MASTODON_BASE_URL is required for streaming")
         self.base_url = base_url.rstrip("/")
         self.token = token
 
     def events(self, hashtag: str):
         tag = hashtag.lstrip("#").strip()
-        url = "%s/api/v1/streaming/hashtag?%s" % (self.base_url, urllib.parse.urlencode({"tag": tag}))
-        request = urllib.request.Request(url, headers={"Accept": "text/event-stream", "Authorization": "Bearer " + self.token})
+        url = "%s/api/v1/streaming/hashtag?%s" % (self._streaming_base_url(), urllib.parse.urlencode({"tag": tag}))
+        headers = {"Accept": "text/event-stream"}
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        request = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 for event in parse_sse(response):
@@ -171,12 +201,66 @@ class MastodonHashtagStream:
                         yield MastodonHashtagFeed._normalize(json.loads(event["data"]))
         except urllib.error.HTTPError as error:
             if error.code in (401, 403):
-                raise SourceAccessError("Mastodon stream access denied (%s); token requires read:statuses" % error.code) from error
+                mode = "credential" if self.token else "public stream"
+                raise SourceAccessError("Mastodon stream access denied (%s); %s is not accepted by this instance" % (error.code, mode)) from error
             if error.code == 429 or 500 <= error.code <= 599:
                 raise TransientCollectionError("Mastodon stream transient HTTP error %s" % error.code) from error
             raise RuntimeError("Mastodon stream HTTP error %s" % error.code) from error
         except (urllib.error.URLError, TimeoutError) as error:
             raise TransientCollectionError("Mastodon stream transport error") from error
+
+    def verify_credentials(self) -> Dict[str, str]:
+        """Validate a user token without exposing it or opening a stream."""
+        if not self.token:
+            raise ValueError("MASTODON_TOKEN is required to validate credentials")
+        request = urllib.request.Request(
+            self.base_url + "/api/v1/accounts/verify_credentials",
+            headers={"Accept": "application/json", "Authorization": "Bearer " + self.token},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                account = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            if error.code in (401, 403):
+                raise SourceAccessError("credential rejected; use a user access token from this instance with read:statuses") from error
+            raise TransientCollectionError("Mastodon credential check HTTP error %s" % error.code) from error
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise TransientCollectionError("Mastodon credential check transport error") from error
+        return {"instance": self.base_url, "account_id": str(account.get("id", "unknown")), "valid": "true"}
+
+    def _streaming_base_url(self) -> str:
+        """Resolve the streaming hostname before attaching Authorization.
+
+        Instances may redirect their REST host to another streaming hostname.
+        Following that redirect with urllib safely drops Authorization, producing
+        a misleading 401. The instance configuration supplies the destination.
+        """
+        payload = None
+        # `configuration.urls.streaming` is exposed by modern Mastodon in v2;
+        # retain v1 only for older compatible implementations.
+        for version in ("v2", "v1"):
+            request = urllib.request.Request(self.base_url + "/api/%s/instance" % version, headers={"Accept": "application/json"})
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    candidate = json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as error:
+                if error.code == 404 and version == "v2":
+                    continue
+                raise TransientCollectionError("could not discover Mastodon streaming host") from error
+            except (urllib.error.URLError, TimeoutError) as error:
+                raise TransientCollectionError("could not discover Mastodon streaming host") from error
+            streaming = ((candidate.get("configuration") or {}).get("urls") or {}).get("streaming")
+            if streaming:
+                payload = streaming
+                break
+        if not payload:
+            return self.base_url
+        parsed = urllib.parse.urlparse(payload)
+        if parsed.scheme == "wss":
+            return "https://" + parsed.netloc + parsed.path.rstrip("/")
+        if parsed.scheme == "ws":
+            return "http://" + parsed.netloc + parsed.path.rstrip("/")
+        return payload.rstrip("/")
 
 
 def parse_sse(lines):

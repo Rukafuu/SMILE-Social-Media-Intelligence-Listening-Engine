@@ -36,4 +36,10 @@ def match_event(content: str) -> Optional[EventMatch]:
     for topic_id, title, required_terms in RULES:
         if all(term in normalized for term in required_terms):
             return EventMatch(topic_id, title, "aliases e ação/objeto compatíveis")
+    # External hashtag samples do not carry the synthetic scenario vocabulary.
+    # Keep the fallback intentionally narrow: it is an observed discussion
+    # cluster, not a claim that every post describes one real-world event.
+    if "bitcoin" in normalized or "#btc" in normalized or " btc " in normalized:
+        return EventMatch("external-bitcoin-discussion", "Bitcoin — discussão pública observada",
+                          "agrupamento heurístico externo por entidade; não implica um evento confirmado")
     return None

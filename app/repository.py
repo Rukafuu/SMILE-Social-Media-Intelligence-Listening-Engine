@@ -114,6 +114,17 @@ class Repository:
                 created_at TEXT NOT NULL,
                 UNIQUE(alert_id, decision, reviewer, created_at)
             );
+            CREATE TABLE IF NOT EXISTS topic_classifications (
+                id INTEGER PRIMARY KEY,
+                topic_id TEXT NOT NULL REFERENCES topics(topic_id),
+                primary_category TEXT,
+                secondary_categories TEXT NOT NULL,
+                classification_method TEXT NOT NULL,
+                classification_reason TEXT NOT NULL,
+                taxonomy_version TEXT NOT NULL,
+                reviewer TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
         # Compatible migration for SQLite databases created by earlier MVP steps.
@@ -196,6 +207,13 @@ class Repository:
     def post_count(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM posts").fetchone()[0])
 
+    def data_profile(self):
+        """Describe the observed data origin without inferring social coverage."""
+        return self.connection.execute(
+            """SELECT COUNT(*) AS total_posts, COALESCE(SUM(is_synthetic), 0) AS synthetic_posts,
+               MIN(timestamp) AS earliest_published_at, MAX(timestamp) AS latest_published_at FROM posts"""
+        ).fetchone()
+
     def posts_between(self, start: str, end: str):
         return self.connection.execute(
             "SELECT * FROM posts WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp", (start, end)
@@ -207,13 +225,37 @@ class Repository:
             """INSERT INTO topics (topic_id, title, primary_category, secondary_categories, classification_method,
                classification_reason, taxonomy_version, first_seen_at, last_seen_at, updated_at)
                VALUES (?, ?, ?, ?, 'deterministic_rules', ?, ?, ?, ?, ?)
-               ON CONFLICT(topic_id) DO UPDATE SET title=excluded.title, primary_category=excluded.primary_category,
-               secondary_categories=excluded.secondary_categories, classification_reason=excluded.classification_reason,
-               taxonomy_version=excluded.taxonomy_version, last_seen_at=excluded.last_seen_at, updated_at=excluded.updated_at""",
+               ON CONFLICT(topic_id) DO UPDATE SET title=excluded.title,
+               primary_category=CASE WHEN topics.classification_method='human_override' THEN topics.primary_category ELSE excluded.primary_category END,
+               secondary_categories=CASE WHEN topics.classification_method='human_override' THEN topics.secondary_categories ELSE excluded.secondary_categories END,
+               classification_method=CASE WHEN topics.classification_method='human_override' THEN topics.classification_method ELSE excluded.classification_method END,
+               classification_reason=CASE WHEN topics.classification_method='human_override' THEN topics.classification_reason ELSE excluded.classification_reason END,
+               taxonomy_version=CASE WHEN topics.classification_method='human_override' THEN topics.taxonomy_version ELSE excluded.taxonomy_version END,
+               last_seen_at=excluded.last_seen_at, updated_at=excluded.updated_at""",
             (topic_id, title, primary_category, json.dumps(secondary_categories), reason, taxonomy_version,
              first_seen, last_seen, utc_now().isoformat()),
         )
         self.connection.commit()
+
+    def override_topic_classification(self, topic_id: str, primary_category: Optional[str], secondary_categories: list,
+                                      reviewer: str, taxonomy_version: str) -> None:
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+        if (secondary_categories and not primary_category) or len(secondary_categories) > 1 or primary_category in secondary_categories:
+            raise ValueError("classification can have one primary and at most one distinct secondary category")
+        reason = "manual classification by " + reviewer.strip()
+        now = utc_now().isoformat()
+        with self.transaction() as connection:
+            connection.execute(
+                """UPDATE topics SET primary_category=?, secondary_categories=?, classification_method='human_override',
+                   classification_reason=?, taxonomy_version=?, updated_at=? WHERE topic_id=?""",
+                (primary_category, json.dumps(secondary_categories), reason, taxonomy_version, now, topic_id),
+            )
+            connection.execute(
+                """INSERT INTO topic_classifications (topic_id, primary_category, secondary_categories, classification_method,
+                   classification_reason, taxonomy_version, reviewer, created_at) VALUES (?, ?, ?, 'human_override', ?, ?, ?, ?)""",
+                (topic_id, primary_category, json.dumps(secondary_categories), reason, taxonomy_version, reviewer.strip(), now),
+            )
 
     def save_topic_window(self, topic_id: str, window_start: str, window_end: str, metrics: dict) -> None:
         self.connection.execute(

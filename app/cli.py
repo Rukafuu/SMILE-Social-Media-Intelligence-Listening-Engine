@@ -4,9 +4,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from datetime import datetime
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 
-from app.collectors import LocalJsonlFeed, MastodonHashtagFeed, MastodonHashtagStream, collect_all, collect_stream
+if __package__ in (None, ""):
+    project_root = Path(__file__).resolve().parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
+from app.settings import load_local_env
+load_local_env()
+
+from app.collectors import (LocalJsonlFeed, MastodonHashtagFeed, MastodonHashtagStream, SourceAccessError,
+                            TransientCollectionError, collect_all, collect_stream, exchange_mastodon_authorization_code)
+from app.settings import upsert_local_env_value
 from app.repository import Repository
 from app.trends import analyze
 from app.agent import AgentError, analyze_topic
@@ -25,6 +38,7 @@ def main() -> None:
     collect.add_argument("--hashtag", help="Mastodon hashtag (without #)")
     collect.add_argument("--mastodon-base-url", default=os.getenv("MASTODON_BASE_URL"))
     collect.add_argument("--max-pages", type=int, help="stop cleanly after this many pages (default: 10 for Mastodon)")
+    collect.add_argument("--public", action="store_true", help="omit the token for a public Mastodon timeline")
     analyze_command = subparsers.add_parser("analyze", help="associate events and calculate trend scores")
     analyze_command.add_argument("--database", default="data/cryptobr.sqlite3")
     analyze_command.add_argument("--as-of", required=True)
@@ -41,6 +55,19 @@ def main() -> None:
     stream.add_argument("--mastodon-base-url", default=os.getenv("MASTODON_BASE_URL"))
     stream.add_argument("--source-key")
     stream.add_argument("--max-events", type=int, default=20)
+    stream.add_argument("--public", action="store_true", help="connect without a token to a public hashtag stream")
+    watch = subparsers.add_parser("watch", help="poll the local feed and refresh complete trend windows")
+    watch.add_argument("--feed", default="data/synthetic_feed.jsonl")
+    watch.add_argument("--database", default="data/cryptobr.sqlite3")
+    watch.add_argument("--page-size", type=int, default=50)
+    watch.add_argument("--source-key", default="local:synthetic:v1")
+    watch.add_argument("--interval-seconds", type=float, default=60.0)
+    watch.add_argument("--max-cycles", type=int, help="bounded run count for demos and tests")
+    doctor = subparsers.add_parser("mastodon-doctor", help="validate Mastodon token without opening a stream")
+    doctor.add_argument("--mastodon-base-url", default=os.getenv("MASTODON_BASE_URL"))
+    authorize = subparsers.add_parser("mastodon-authorize", help="exchange one-time Mastodon authorization code for a user token")
+    authorize.add_argument("--mastodon-base-url", default=os.getenv("MASTODON_BASE_URL"))
+    authorize.add_argument("--redirect-uri", default=os.getenv("MASTODON_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob"))
     args = parser.parse_args()
     if args.command == "collect":
         repository = Repository(args.database)
@@ -53,7 +80,8 @@ def main() -> None:
             else:
                 if not args.hashtag:
                     parser.error("--hashtag is required for --source mastodon")
-                feed = MastodonHashtagFeed(args.mastodon_base_url, os.getenv("MASTODON_TOKEN"), args.page_size)
+                token = None if args.public else os.getenv("MASTODON_TOKEN")
+                feed = MastodonHashtagFeed(args.mastodon_base_url, token, args.page_size)
                 source_key = args.source_key or "mastodon:%s:%s" % (args.mastodon_base_url, args.hashtag.casefold())
                 query = args.hashtag
             max_pages = args.max_pages if args.max_pages is not None else (10 if args.source == "mastodon" else None)
@@ -90,13 +118,70 @@ def main() -> None:
         repository = Repository(args.database)
         repository.initialize()
         try:
-            base_url = args.mastodon_base_url
-            source_key = args.source_key or "mastodon-stream:%s:%s" % (base_url, args.hashtag.casefold())
-            stream_source = MastodonHashtagStream(base_url, os.getenv("MASTODON_TOKEN"))
-            print(json.dumps(collect_stream(repository, stream_source, source_key, args.hashtag, args.max_events), ensure_ascii=False))
+            try:
+                base_url = args.mastodon_base_url
+                source_key = args.source_key or "mastodon-stream:%s:%s" % (base_url, args.hashtag.casefold())
+                token = None if args.public else os.getenv("MASTODON_TOKEN")
+                stream_source = MastodonHashtagStream(base_url, token)
+                print(json.dumps(collect_stream(repository, stream_source, source_key, args.hashtag, args.max_events), ensure_ascii=False))
+            except (SourceAccessError, TransientCollectionError, ValueError) as error:
+                print(json.dumps({"status": "stream_unavailable", "reason": str(error)}, ensure_ascii=False))
+            except KeyboardInterrupt:
+                print(json.dumps({"status": "interrupted", "events": 0, "inserted": 0}, ensure_ascii=False))
         finally:
             repository.close()
+    if args.command == "watch":
+        if args.interval_seconds <= 0:
+            parser.error("--interval-seconds must be greater than zero")
+        if args.max_cycles is not None and args.max_cycles <= 0:
+            parser.error("--max-cycles must be greater than zero")
+        repository = Repository(args.database)
+        repository.initialize()
+        completed = 0
+        try:
+            while args.max_cycles is None or completed < args.max_cycles:
+                result = collect_all(
+                    repository,
+                    LocalJsonlFeed(args.feed, args.page_size),
+                    args.source_key,
+                    reopen_exhausted=True,
+                )
+                # Only analyze closed fifteen-minute windows. The in-progress
+                # interval is deliberately excluded from a trend conclusion.
+                now = datetime.now(timezone.utc)
+                closed = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
+                topics = analyze(repository, closed)
+                completed += 1
+                print(json.dumps({"status": "watch_cycle_completed", "cycle": completed,
+                                  "collection": result, "analysis_as_of": closed.isoformat(),
+                                  "topics": len(topics)}, ensure_ascii=False))
+                if args.max_cycles is None or completed < args.max_cycles:
+                    time.sleep(args.interval_seconds)
+        except KeyboardInterrupt:
+            print(json.dumps({"status": "watch_interrupted", "cycles": completed}, ensure_ascii=False))
+        finally:
+            repository.close()
+    if args.command == "mastodon-doctor":
+        try:
+            stream_source = MastodonHashtagStream(args.mastodon_base_url, os.getenv("MASTODON_TOKEN"))
+            print(json.dumps({"status": "credentials_valid", **stream_source.verify_credentials()}, ensure_ascii=False))
+        except (SourceAccessError, TransientCollectionError, ValueError) as error:
+            print(json.dumps({"status": "credentials_invalid_or_unavailable", "reason": str(error)}, ensure_ascii=False))
+    if args.command == "mastodon-authorize":
+        try:
+            payload = exchange_mastodon_authorization_code(
+                args.mastodon_base_url, os.getenv("MASTODON_CLIENT_ID"), os.getenv("MASTODON_CLIENT_SECRET"),
+                os.getenv("MASTODON_AUTHORIZATION_CODE"), args.redirect_uri,
+            )
+            upsert_local_env_value("MASTODON_TOKEN", payload["access_token"],
+                                   remove_keys=("MASTODON_AUTHORIZATION_CODE",))
+            print(json.dumps({"status": "user_token_saved", "scope": payload.get("scope", "")}, ensure_ascii=False))
+        except (SourceAccessError, TransientCollectionError, ValueError) as error:
+            print(json.dumps({"status": "authorization_failed", "reason": str(error)}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(json.dumps({"status": "interrupted", "events": 0, "inserted": 0}, ensure_ascii=False))

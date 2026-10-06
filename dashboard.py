@@ -5,13 +5,21 @@ import os
 import streamlit as st
 
 from app.repository import Repository
+from app.agent_types import evidence_for_topic
+from app.categories import load_taxonomy
 
 
 DATABASE = os.getenv("CRYPTOBR_DATABASE", "data/cryptobr.sqlite3")
 
 
-@st.cache_resource
 def repository():
+    """Create the connection in the current Streamlit script thread.
+
+    Streamlit reruns can execute in a different thread; caching a sqlite3
+    connection across those reruns raises ProgrammingError before the dashboard
+    can render. SQLite remains the source of truth, so a short-lived local
+    connection is the safer dashboard boundary.
+    """
     instance = Repository(DATABASE)
     instance.initialize()
     return instance
@@ -20,27 +28,48 @@ def repository():
 def main():
     st.set_page_config(page_title="CryptoBR Social Intelligence", layout="wide")
     st.title("CryptoBR Social Intelligence")
-    st.caption("Protótipo local — todos os posts e alegações exibidos nesta instância são sintéticos.")
     store = repository()
+    profile = store.data_profile()
+    total_posts = profile["total_posts"]
+    synthetic_posts = profile["synthetic_posts"]
+    if total_posts and synthetic_posts == total_posts:
+        st.caption("Dados de demonstração — todos os posts deste banco são sintéticos.")
+    elif total_posts and not synthetic_posts:
+        st.caption("Dados externos capturados — cobertura limitada à fonte e consulta declaradas abaixo; não representa discussão global.")
+    elif total_posts:
+        st.caption("Conjunto misto — inclui posts sintéticos e externos; compare apenas recortes de mesma origem e cobertura.")
+    else:
+        st.caption("Banco sem posts coletados.")
+    rows = store.dashboard_topics()
     collection = store.latest_collection_run()
     if collection:
         coverage = json.loads(collection["coverage"] or "{}")
-        st.sidebar.subheader("Coleta")
-        st.sidebar.caption("Estado: %s · %s" % (collection["status"], collection["finished_at"] or "em andamento"))
-        st.sidebar.caption("Posts inseridos: %s · Páginas: %s" % (collection["inserted_posts"], collection["pages"]))
-        st.sidebar.caption("Cobertura: " + coverage.get("kind", "não informada"))
-        if coverage.get("earliest_published_at"):
-            st.sidebar.caption("Publicações: %s → %s" % (coverage["earliest_published_at"], coverage["latest_published_at"]))
-    rows = store.dashboard_topics()
+        st.caption(
+            "Coleta mais recente: %s · %s · %s posts inseridos · concluída em %s"
+            % (collection["source_key"], collection["status"], collection["inserted_posts"],
+               collection["finished_at"] or "em andamento")
+        )
+        if coverage:
+            st.caption("Cobertura declarada: " + json.dumps(coverage, ensure_ascii=False))
+        if collection["status"] in {"failed", "interrupted"}:
+            st.warning("A última coleta não terminou normalmente; os dados exibidos podem estar defasados.")
     if not rows:
         st.info("Ainda não há análise. Gere o dataset, colete e execute `python -m app.cli analyze --with-agent`.")
         return
     categories = ["Todas"] + sorted({row["primary_category"] for row in rows if row["primary_category"]})
     selected = st.sidebar.selectbox("Categoria", categories)
-    filtered = [row for row in rows if selected == "Todas" or row["primary_category"] == selected]
+    secondary = ["Todas"] + sorted({category for row in rows for category in json.loads(row["secondary_categories"] or "[]")})
+    selected_secondary = st.sidebar.selectbox("Categoria secundária", secondary)
+    filtered = [row for row in rows if (selected == "Todas" or row["primary_category"] == selected)
+                and (selected_secondary == "Todas" or selected_secondary in json.loads(row["secondary_categories"] or "[]"))]
     st.sidebar.caption("Filtros secundários não alteram o ranking global; o mesmo topic_id não é somado duas vezes.")
-    st.subheader("Ranking por tendência")
-    display = [{"Tema": row["title"], "Categoria": row["primary_category"], "Score": row["score"],
+    st.subheader("Ranking: score versus volume")
+    score_order = {row["topic_id"]: index for index, row in enumerate(rows, start=1)}
+    volume_order = {row["topic_id"]: index for index, row in enumerate(
+        sorted(rows, key=lambda item: (-item["post_count"], item["title"])), start=1
+    )}
+    display = [{"Rank score": score_order[row["topic_id"]], "Rank volume": volume_order[row["topic_id"]],
+                "Tema": row["title"], "Categoria": row["primary_category"], "Score": row["score"],
                 "Estágio": row["stage"], "Posts": row["post_count"], "Autores": row["author_count"],
                 "HHI": round(row["hhi"], 3) if row["hhi"] is not None else None,
                 "Recomendação": row["recommendation"] or "sem análise"} for row in filtered]
@@ -54,6 +83,37 @@ def main():
     third.metric("Autores distintos", row["author_count"])
     st.json({"componentes": json.loads(row["components"]), "modo_de_análise": row["analysis_mode"],
              "atualizado_em": row["updated_at"]})
+    taxonomy = load_taxonomy()
+    category_ids = [item["id"] for item in taxonomy["categories"]]
+    st.subheader("Correção de classificação")
+    with st.form("classification-%s" % topic_id):
+        reviewer = st.text_input("Revisor da classificação", key="classification-reviewer-" + topic_id)
+        primary = st.selectbox("Categoria principal", ["Sem categoria"] + category_ids,
+                               index=(category_ids.index(row["primary_category"]) + 1)
+                               if row["primary_category"] in category_ids else 0)
+        allowed_secondary = ["Nenhuma"] + [item for item in category_ids if item != primary]
+        current_secondary = json.loads(row["secondary_categories"] or "[]")
+        secondary = st.selectbox("Categoria secundária", allowed_secondary,
+                                 index=allowed_secondary.index(current_secondary[0])
+                                 if current_secondary and current_secondary[0] in allowed_secondary else 0)
+        if st.form_submit_button("Salvar correção"):
+            try:
+                store.override_topic_classification(
+                    topic_id, None if primary == "Sem categoria" else primary,
+                    [] if secondary == "Nenhuma" else [secondary], reviewer, taxonomy["version"],
+                )
+                st.success("Correção registrada; ela prevalece nas próximas análises.")
+            except ValueError as error:
+                st.error(str(error))
+    evidence = evidence_for_topic(store, topic_id, 8)
+    if evidence:
+        st.subheader("Evidências capturadas")
+        for item in evidence:
+            st.write("%s — %s" % (item["post_id"], item["content"]))
+            if item["source_url"].startswith(("https://", "http://")):
+                st.link_button("Abrir referência", item["source_url"], key="source-" + item["post_id"])
+            else:
+                st.caption("Referência local: " + item["source_url"])
     if row["alert_id"]:
         alert = json.loads(row["payload"])
         st.subheader("Sugestão automática")

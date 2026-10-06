@@ -16,3 +16,4 @@ def evidence_for_topic(repository, topic_id: str, limit: int) -> List[dict]:
         if len(result) >= limit:
             break
     return result
+    

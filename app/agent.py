@@ -19,7 +19,7 @@ from app.validation import validate_analysis
 
 
 class AgentError(RuntimeError):
-    pass
+    ...
 
 
 TOOLS = [
