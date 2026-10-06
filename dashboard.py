@@ -1,15 +1,21 @@
-"""Local Streamlit review console for the synthetic CryptoBR MVP."""
+"""Local Streamlit review console for collected social data."""
 import json
 import os
+from datetime import datetime, timezone
 
 import streamlit as st
 
 from app.repository import Repository
 from app.agent_types import evidence_for_topic
 from app.categories import load_taxonomy
+from app.collectors import MastodonHashtagFeed, SourceAccessError, TransientCollectionError, collect_all
+from app.settings import load_local_env
 
 
-DATABASE = os.getenv("CRYPTOBR_DATABASE", "data/cryptobr.sqlite3")
+# External collection is the product-facing default. The deterministic dataset
+# remains available only when a demo explicitly sets CRYPTOBR_DATABASE.
+load_local_env()
+DATABASE = os.getenv("CRYPTOBR_DATABASE", "data/mastodon_public.sqlite3")
 
 
 def repository():
@@ -40,6 +46,25 @@ def main():
         st.caption("Conjunto misto — inclui posts sintéticos e externos; compare apenas recortes de mesma origem e cobertura.")
     else:
         st.caption("Banco sem posts coletados.")
+    with st.sidebar:
+        st.divider()
+        st.subheader("Coleta pública")
+        hashtag = st.text_input("Hashtag", value="bitcoin", help="Sem #. A coleta usa uma página pública da instância.")
+        instance = st.text_input("Instância Mastodon", value=os.getenv("MASTODON_BASE_URL", "https://mastodon.social"))
+        if st.button("Buscar agora", type="primary", use_container_width=True):
+            try:
+                normalized_tag = hashtag.strip().lstrip("#")
+                if not normalized_tag:
+                    raise ValueError("informe uma hashtag")
+                source_key = "mastodon-public:%s:%s:%s" % (
+                    instance.rstrip("/"), normalized_tag.casefold(), datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"),
+                )
+                result = collect_all(store, MastodonHashtagFeed(instance, token=None), source_key,
+                                     query=normalized_tag, max_pages=1)
+                st.success("Busca concluída: %s novos posts." % result["inserted"])
+                st.rerun()
+            except (ValueError, SourceAccessError, TransientCollectionError) as error:
+                st.error("Não foi possível coletar a hashtag: " + str(error))
     rows = store.dashboard_topics()
     collection = store.latest_collection_run()
     if collection:

@@ -94,6 +94,57 @@ def _simulated(topic: dict) -> dict:
             "risk_flags": [], "analysis_mode": "simulated"}
 
 
+def grounded_payload_for_topic(topic: dict, evidence: List[dict]) -> dict:
+    """Build a conservative, evidence-backed analysis from repository data only.
+
+    This prevents ungrounded model summaries from inventing sources, claims, or
+    post IDs that do not exist in the local dataset.
+    """
+    refs = [row["post_id"] for row in evidence if row.get("post_id")]
+    synthetic_count = sum(1 for row in evidence if row.get("is_synthetic"))
+    cited_count = sum(1 for row in evidence if row.get("cited_source"))
+    summary = (
+        f"Baseado em {len(evidence)} evidências locais do tópico, {synthetic_count} foram marcadas "
+        f"como sintéticas e {cited_count} citam uma fonte declarada. Sem confirmação independente, "
+        "o tema permanece em observação conservadora."
+    )
+    claims = [
+        f"O tópico reúne {len(evidence)} posts locais válidos na janela atual.",
+        f"{synthetic_count} destes posts foram marcados como sintéticos e {len(evidence) - synthetic_count} não foram identificados como sintéticos.",
+    ]
+    if not refs:
+        recommendation = "DISCARD"
+    elif synthetic_count == len(evidence):
+        recommendation = "DISCARD"
+    else:
+        recommendation = "MONITOR"
+    uncertainties = [
+        "A análise usa apenas evidências locais persistidas no banco e não pressupõe que repetição seja confirmação independentes.",
+    ]
+    if not cited_count:
+        uncertainties.append("Nenhuma evidência do conjunto cita uma fonte declarada.")
+    if synthetic_count:
+        uncertainties.append("Há posts marcados como sintéticos dentro do conjunto analisado.")
+    risk_flags = []
+    if synthetic_count:
+        risk_flags.append("synthetic_content_detected")
+    if not cited_count:
+        risk_flags.append("no_cited_sources")
+    if not refs:
+        risk_flags.append("no_local_evidence")
+    return {
+        "topic_id": topic["topic_id"],
+        "topic": topic["topic"],
+        "recommendation": recommendation,
+        "summary": summary,
+        "claims": claims,
+        "evidence_refs": refs[:8],
+        "uncertainties": uncertainties,
+        "risk_flags": sorted(set(risk_flags)),
+        "analysis_mode": "grounded"
+    }
+
+
 def _apply_host_limits(payload: dict, topic: dict) -> dict:
     """The model can be more conservative, never less conservative than host rules."""
     if payload.get("recommendation") == "HIGHLIGHT":
@@ -128,16 +179,34 @@ def analyze_topic(repository: Repository, topic: dict) -> dict:
         message = response["choices"][0]["message"]
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
-            payload = _parse_model_json(message.get("content") or "{}")
+            try:
+                payload = _parse_model_json(message.get("content") or "{}")
+            except AgentError:
+                evidence = evidence_for_topic(repository, topic["topic_id"], 8)
+                grounded = grounded_payload_for_topic(topic, evidence)
+                return validate_analysis(repository, topic, grounded)
             allowed = {"HIGHLIGHT", "MONITOR", "DISCARD"}
             recommendation = str(payload.get("recommendation", "")).strip().upper()
             if recommendation not in allowed:
-                # The model may be useful for the explanation yet fail the
-                # enum contract. Host policy chooses the conservative outcome.
-                recommendation = "MONITOR"
-                payload.setdefault("risk_flags", []).append("invalid_model_recommendation_limited_to_monitor")
+                evidence = evidence_for_topic(repository, topic["topic_id"], 8)
+                grounded = grounded_payload_for_topic(topic, evidence)
+                return validate_analysis(repository, topic, grounded)
             payload["recommendation"] = recommendation
             payload.update({"topic_id": topic["topic_id"], "topic": topic["topic"], "analysis_mode": "openrouter"})
+            evidence = evidence_for_topic(repository, topic["topic_id"], 8)
+            real_refs = [row["post_id"] for row in evidence if row.get("post_id")][:8]
+            if payload.get("evidence_refs"):
+                payload["evidence_refs"] = [reference for reference in payload["evidence_refs"] if reference in real_refs][:8]
+            if not payload.get("evidence_refs"):
+                payload["evidence_refs"] = real_refs
+            if not payload.get("summary") or not str(payload.get("summary")).strip():
+                payload["summary"] = grounded_payload_for_topic(topic, evidence)["summary"]
+            if not payload.get("claims"):
+                payload["claims"] = grounded_payload_for_topic(topic, evidence)["claims"]
+            if not payload.get("uncertainties"):
+                payload["uncertainties"] = grounded_payload_for_topic(topic, evidence)["uncertainties"]
+            if not payload.get("risk_flags"):
+                payload["risk_flags"] = grounded_payload_for_topic(topic, evidence)["risk_flags"]
             return validate_analysis(repository, topic, _apply_host_limits(payload, topic))
         messages.append(message)
         for call in tool_calls:
@@ -147,4 +216,5 @@ def analyze_topic(repository: Repository, topic: dict) -> dict:
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
             if calls >= 4:
                 break
-    raise AgentError("tool-call budget exhausted")
+    evidence = evidence_for_topic(repository, topic["topic_id"], 8)
+    return validate_analysis(repository, topic, grounded_payload_for_topic(topic, evidence))

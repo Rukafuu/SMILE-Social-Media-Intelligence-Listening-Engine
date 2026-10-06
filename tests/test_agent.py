@@ -1,6 +1,6 @@
 import unittest
 
-from app.agent import AgentError, _parse_model_json, dispatch_tool
+from app.agent import AgentError, _parse_model_json, dispatch_tool, grounded_payload_for_topic
 
 
 class AgentSafetyTests(unittest.TestCase):
@@ -9,6 +9,15 @@ class AgentSafetyTests(unittest.TestCase):
 
     def test_model_json_can_have_a_short_text_prefix(self):
         self.assertEqual({"recommendation": "MONITOR"}, _parse_model_json("Here is the result: {\"recommendation\": \"MONITOR\"}"))
+
+    def test_grounded_payload_uses_real_evidence(self):
+        payload = grounded_payload_for_topic({"topic_id": "topic-1", "topic": "Teste"}, [
+            {"post_id": "synthetic-1", "is_synthetic": 1, "cited_source": None},
+            {"post_id": "real-2", "is_synthetic": 0, "cited_source": "https://example.com"},
+        ])
+        self.assertEqual(["synthetic-1", "real-2"], payload["evidence_refs"])
+        self.assertIn("2 evidências", payload["summary"])
+        self.assertIn("MONITOR", payload["recommendation"])
 
     def test_dispatch_rejects_another_topic(self):
         with self.assertRaises(AgentError):

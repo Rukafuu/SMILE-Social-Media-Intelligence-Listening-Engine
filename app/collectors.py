@@ -26,6 +26,20 @@ class SourceAccessError(RuntimeError):
     pass
 
 
+def build_mastodon_auth_url(base_url: str, client_id: str, redirect_uri: str = "urn:ietf:wg:oauth:2.0:oob") -> str:
+    """Build the exact OAuth authorize URL for a user code flow on this instance."""
+    if not all((base_url, client_id, redirect_uri)):
+        raise ValueError("base URL, client ID and redirect URI are required")
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "read:statuses",
+        "force_login": "true",
+    }
+    return base_url.rstrip("/") + "/oauth/authorize?" + urllib.parse.urlencode(params)
+
+
 def exchange_mastodon_authorization_code(base_url: str, client_id: str, client_secret: str,
                                          code: str, redirect_uri: str) -> Dict[str, Any]:
     """Exchange a one-use authorization code for a user access token."""

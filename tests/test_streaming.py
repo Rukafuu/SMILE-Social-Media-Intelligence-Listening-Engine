@@ -3,7 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.collectors import MastodonHashtagFeed, collect_stream, exchange_mastodon_authorization_code, parse_sse
+from app.collectors import (MastodonHashtagFeed, build_mastodon_auth_url, collect_stream,
+                           exchange_mastodon_authorization_code, parse_sse)
 from app.repository import Repository
 
 
@@ -77,6 +78,13 @@ class StreamingTests(unittest.TestCase):
         request = opener.call_args.args[0]
         self.assertEqual("https://example.social/oauth/token", request.full_url)
         self.assertIn(b"grant_type=authorization_code", request.data)
+
+    def test_build_mastodon_auth_url_includes_scope_and_redirect(self):
+        url = build_mastodon_auth_url("https://mastodon.social", "client-id", "urn:ietf:wg:oauth:2.0:oob")
+        self.assertIn("https://mastodon.social/oauth/authorize", url)
+        self.assertIn("client_id=client-id", url)
+        self.assertIn("redirect_uri=urn%3Aietf%3Awg%3Aoauth%3A2.0%3Aoob", url)
+        self.assertIn("scope=read%3Astatuses", url)
 
 
 if __name__ == "__main__":

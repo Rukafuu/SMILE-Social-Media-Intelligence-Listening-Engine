@@ -18,7 +18,8 @@ from app.settings import load_local_env
 load_local_env()
 
 from app.collectors import (LocalJsonlFeed, MastodonHashtagFeed, MastodonHashtagStream, SourceAccessError,
-                            TransientCollectionError, collect_all, collect_stream, exchange_mastodon_authorization_code)
+                            TransientCollectionError, build_mastodon_auth_url, collect_all, collect_stream,
+                            exchange_mastodon_authorization_code)
 from app.settings import upsert_local_env_value
 from app.repository import Repository
 from app.trends import analyze
@@ -65,6 +66,9 @@ def main() -> None:
     watch.add_argument("--max-cycles", type=int, help="bounded run count for demos and tests")
     doctor = subparsers.add_parser("mastodon-doctor", help="validate Mastodon token without opening a stream")
     doctor.add_argument("--mastodon-base-url", default=os.getenv("MASTODON_BASE_URL"))
+    auth_url = subparsers.add_parser("mastodon-auth-url", help="print the OAuth authorize URL for a real Mastodon login")
+    auth_url.add_argument("--mastodon-base-url", default=os.getenv("MASTODON_BASE_URL"))
+    auth_url.add_argument("--redirect-uri", default=os.getenv("MASTODON_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob"))
     authorize = subparsers.add_parser("mastodon-authorize", help="exchange one-time Mastodon authorization code for a user token")
     authorize.add_argument("--mastodon-base-url", default=os.getenv("MASTODON_BASE_URL"))
     authorize.add_argument("--redirect-uri", default=os.getenv("MASTODON_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob"))
@@ -167,6 +171,12 @@ def main() -> None:
             print(json.dumps({"status": "credentials_valid", **stream_source.verify_credentials()}, ensure_ascii=False))
         except (SourceAccessError, TransientCollectionError, ValueError) as error:
             print(json.dumps({"status": "credentials_invalid_or_unavailable", "reason": str(error)}, ensure_ascii=False))
+    if args.command == "mastodon-auth-url":
+        try:
+            url = build_mastodon_auth_url(args.mastodon_base_url, os.getenv("MASTODON_CLIENT_ID"), args.redirect_uri)
+            print(json.dumps({"status": "authorization_url", "url": url}, ensure_ascii=False))
+        except ValueError as error:
+            print(json.dumps({"status": "authorization_url_unavailable", "reason": str(error)}, ensure_ascii=False))
     if args.command == "mastodon-authorize":
         try:
             payload = exchange_mastodon_authorization_code(

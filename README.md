@@ -43,7 +43,8 @@ python3 -m app.cli analyze --as-of 2026-10-06T14:45:00Z
 python3 scripts/generate_dataset.py --seed 42 --as-of 2026-10-06T15:00:00Z --batch update --append
 python3 -m app.cli collect --reopen-exhausted
 OPENROUTER_API_KEY='...' python3 -m app.cli analyze --as-of 2026-10-06T15:00:00Z --with-agent
-streamlit run dashboard.py
+# Painel da demonstração sintética (somente para o roteiro reproduzível):
+CRYPTOBR_DATABASE=data/cryptobr.sqlite3 streamlit run dashboard.py
 python3 -m unittest discover -s tests -v
 ```
 
@@ -81,8 +82,8 @@ uma credencial inválida bloqueie a fonte:
 .venv/bin/python app/cli.py collect --source mastodon --public --hashtag bitcoin --max-pages 1
 ```
 
-Para abrir no painel o banco dessa coleta externa (sem misturá-lo ao dataset de
-demonstração), execute:
+O painel abre por padrão o banco dessa coleta externa (sem misturá-lo ao
+dataset de demonstração). Para indicar o caminho explicitamente, execute:
 
 ```bash
 CRYPTOBR_DATABASE=data/mastodon_public.sqlite3 .venv/bin/streamlit run dashboard.py
@@ -91,6 +92,10 @@ CRYPTOBR_DATABASE=data/mastodon_public.sqlite3 .venv/bin/streamlit run dashboard
 Posts externos são exibidos como cobertura limitada da consulta/instância. O
 primeiro agrupamento fora do dataset é deliberadamente estreito (`Bitcoin —
 discussão pública observada`) e heurístico; não é uma confirmação de evento.
+
+No macOS, `start_dashboard.command` abre o painel por duplo clique. Dentro do
+painel, informe uma hashtag e clique em **Buscar agora**; não é necessário
+montar comandos de coleta no terminal.
 
 Erros `401` e `403` param a coleta para correção de acesso; `429`, `5xx` e erros
 de transporte usam o retry limitado. Não há scraping HTML nem tentativa de
