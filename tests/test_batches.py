@@ -9,7 +9,7 @@ from app.agent import analyze_topic
 from app.collectors import LocalJsonlFeed, collect_all
 from app.repository import Repository
 from app.trends import analyze
-from scripts.generate_dataset import build_records
+from scripts.generate_dataset import build_records, write_fixture
 
 
 AS_OF = datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc)
@@ -26,12 +26,12 @@ class BatchUpdateTests(unittest.TestCase):
     def test_batches_preserve_topic_identity_and_prior_review(self):
         initial = build_records(AS_OF, 42, "initial")
         update = build_records(AS_OF, 42, "update")
-        self.assertEqual((AS_OF - timedelta(minutes=15)).isoformat().replace("+00:00", "Z"), initial[-1]["timestamp"])
-        self.assertEqual(AS_OF.isoformat().replace("+00:00", "Z"), update[-1]["timestamp"])
+        self.assertLess(initial[-1]["timestamp"], (AS_OF - timedelta(minutes=15)).isoformat().replace("+00:00", "Z"))
+        self.assertLess(update[-1]["timestamp"], AS_OF.isoformat().replace("+00:00", "Z"))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             feed_path = root / "feed.jsonl"
-            write_records(feed_path, initial)
+            write_fixture(feed_path, AS_OF, 42, "initial")
             repository = Repository(str(root / "database.sqlite3"))
             repository.initialize()
             try:
@@ -43,7 +43,7 @@ class BatchUpdateTests(unittest.TestCase):
                 alert_id = repository.save_alert(first_aurora["topic_id"], alert["analysis_mode"], alert["recommendation"], alert)
                 repository.save_review(alert_id, "EDIT", "Manter em observação", "ana")
 
-                write_records(feed_path, update, "a")
+                write_fixture(feed_path, AS_OF, 42, "update", append=True)
                 collected = collect_all(repository, LocalJsonlFeed(str(feed_path), page_size=50), "synthetic-batches", reopen_exhausted=True)
                 self.assertGreater(collected["inserted"], 0)
                 final_results = analyze(repository, AS_OF)
@@ -59,3 +59,4 @@ class BatchUpdateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -16,7 +16,7 @@ class AgentSafetyTests(unittest.TestCase):
             {"post_id": "real-2", "is_synthetic": 0, "cited_source": "https://example.com"},
         ])
         self.assertEqual(["synthetic-1", "real-2"], payload["evidence_refs"])
-        self.assertIn("2 evidências", payload["summary"])
+        self.assertEqual("deterministic_no_llm", payload["analysis_mode"])
         self.assertIn("MONITOR", payload["recommendation"])
 
     def test_dispatch_rejects_another_topic(self):
@@ -30,3 +30,4 @@ class AgentSafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

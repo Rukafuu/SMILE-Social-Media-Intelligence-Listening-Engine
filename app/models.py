@@ -32,6 +32,7 @@ class Post:
     cited_source: Optional[str] = None
     event_published_at: Optional[datetime] = None
     is_synthetic: bool = True
+    source_kind: str = "unverified"
 
     @classmethod
     def from_feed(cls, payload: Dict[str, Any], collected_at: datetime) -> "Post":
@@ -39,6 +40,18 @@ class Post:
         missing = [field for field in required if not payload.get(field)]
         if missing:
             raise ValueError("missing required fields: " + ", ".join(missing))
+        for field in ("likes", "comments", "reposts", "views"):
+            value = payload.get(field)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(field + " must be a nonnegative integer or null")
+        synthetic = payload.get("is_synthetic", True)
+        if type(synthetic) is not bool:
+            raise ValueError("is_synthetic must be a boolean")
+        kind = payload.get("source_kind", "unverified")
+        if kind not in {"unverified", "synthetic_official"}:
+            raise ValueError("unknown source_kind")
+        if kind == "synthetic_official" and (not synthetic or payload["platform"] != "synthetic"):
+            raise ValueError("simulation authority requires an explicitly synthetic post")
         return cls(
             post_id=str(payload["post_id"]),
             platform=str(payload["platform"]),
@@ -53,6 +66,7 @@ class Post:
             cited_source=payload.get("cited_source"),
             event_published_at=(parse_utc(payload["event_published_at"])
                                 if payload.get("event_published_at") else None),
-            is_synthetic=bool(payload.get("is_synthetic", True)),
+            is_synthetic=synthetic, source_kind=kind,
         )
+
 

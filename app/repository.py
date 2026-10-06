@@ -22,6 +22,7 @@ class Repository:
         self.connection = sqlite3.connect(database_path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
+        self.connection.execute("PRAGMA journal_mode = WAL")
 
     def close(self) -> None:
         self.connection.close()
@@ -131,11 +132,39 @@ class Repository:
         columns = {row[1] for row in self.connection.execute("PRAGMA table_info(collection_runs)")}
         if "coverage" not in columns:
             self.connection.execute("ALTER TABLE collection_runs ADD COLUMN coverage TEXT")
+        migrations = {
+            "posts": {"source_kind": "TEXT NOT NULL DEFAULT 'unverified'"},
+            "topic_windows": {"metrics_version": "INTEGER", "coverage": "TEXT", "circulation": "TEXT"},
+            "alerts": {"window_start": "TEXT", "window_end": "TEXT", "metrics_version": "INTEGER", "analysis_key": "TEXT"},
+            "checkpoints": {"prefix_hash": "TEXT"},
+        }
+        for table, fields in migrations.items():
+            present = {row[1] for row in self.connection.execute("PRAGMA table_info(" + table + ")")}
+            for name, definition in fields.items():
+                if name not in present:
+                    self.connection.execute("ALTER TABLE " + table + " ADD COLUMN " + name + " " + definition)
+        self.connection.executescript("""
+            CREATE TABLE IF NOT EXISTS topic_snapshots (
+                topic_id TEXT NOT NULL REFERENCES topics(topic_id), window_start TEXT NOT NULL,
+                window_end TEXT NOT NULL, version INTEGER NOT NULL, fingerprint TEXT NOT NULL,
+                metrics TEXT NOT NULL, evidence TEXT NOT NULL, created_at TEXT NOT NULL,
+                PRIMARY KEY(topic_id, window_start, window_end, version)
+            );
+            CREATE TABLE IF NOT EXISTS agent_calls (
+                id INTEGER PRIMARY KEY, topic_id TEXT NOT NULL, window_end TEXT,
+                metrics_version INTEGER, tool_name TEXT NOT NULL, arguments TEXT NOT NULL,
+                evidence_refs TEXT NOT NULL, created_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS alert_analysis_key ON alerts(analysis_key) WHERE analysis_key IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS posts_timestamp ON posts(timestamp);
+        """)
         self.connection.commit()
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         try:
+            if not self.connection.in_transaction:
+                self.connection.execute("BEGIN IMMEDIATE")
             yield self.connection
             self.connection.commit()
         except Exception:
@@ -144,7 +173,7 @@ class Repository:
 
     def get_checkpoint(self, source_key: str) -> Optional[sqlite3.Row]:
         return self.connection.execute(
-            "SELECT source_key, cursor, exhausted, updated_at FROM checkpoints WHERE source_key = ?", (source_key,)
+            "SELECT source_key, cursor, exhausted, updated_at, prefix_hash FROM checkpoints WHERE source_key = ?", (source_key,)
         ).fetchone()
 
     def start_run(self, source_key: str) -> int:
@@ -170,30 +199,32 @@ class Repository:
         )
         self.connection.commit()
 
-    def persist_page(self, source_key: str, next_cursor: Optional[str], exhausted: bool, posts: Iterable[Post]) -> int:
+    def persist_page(self, source_key: str, next_cursor: Optional[str], exhausted: bool, posts: Iterable[Post], prefix_hash: Optional[str] = None) -> int:
         inserted = 0
         with self.transaction() as connection:
             for post in posts:
+                if post.canonical_uri and connection.execute("SELECT 1 FROM posts WHERE canonical_uri=? LIMIT 1", (post.canonical_uri,)).fetchone():
+                    continue
                 normalized = " ".join(post.content.casefold().split())
                 content_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
                 result = connection.execute(
                     """INSERT OR IGNORE INTO posts (
                         platform, post_id, timestamp, collected_at, content, normalized_content, content_hash,
                         author_id, source_url, likes, comments, reposts, views, canonical_uri, repost_of,
-                        cited_source, event_published_at, is_synthetic
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        cited_source, event_published_at, is_synthetic, source_kind
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (post.platform, post.post_id, post.timestamp.isoformat(), post.collected_at.isoformat(),
                      post.content, normalized, content_hash, post.author_id, post.source_url, post.likes,
                      post.comments, post.reposts, post.views, post.canonical_uri, post.repost_of,
                      post.cited_source, post.event_published_at.isoformat() if post.event_published_at else None,
-                     int(post.is_synthetic)),
+                     int(post.is_synthetic), post.source_kind),
                 )
                 inserted += result.rowcount
             connection.execute(
-                """INSERT INTO checkpoints (source_key, cursor, exhausted, updated_at) VALUES (?, ?, ?, ?)
+                """INSERT INTO checkpoints (source_key, cursor, exhausted, updated_at, prefix_hash) VALUES (?, ?, ?, ?, ?)
                    ON CONFLICT(source_key) DO UPDATE SET cursor=excluded.cursor, exhausted=excluded.exhausted,
-                   updated_at=excluded.updated_at""",
-                (source_key, next_cursor, int(exhausted), utc_now().isoformat()),
+                   updated_at=excluded.updated_at, prefix_hash=excluded.prefix_hash""",
+                (source_key, next_cursor, int(exhausted), utc_now().isoformat(), prefix_hash),
             )
         return inserted
 
@@ -216,7 +247,7 @@ class Repository:
 
     def posts_between(self, start: str, end: str):
         return self.connection.execute(
-            "SELECT * FROM posts WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp", (start, end)
+            "SELECT * FROM posts WHERE julianday(timestamp) >= julianday(?) AND julianday(timestamp) < julianday(?) ORDER BY julianday(timestamp), platform, post_id", (start, end)
         ).fetchall()
 
     def upsert_topic(self, topic_id: str, title: str, primary_category: Optional[str], secondary_categories: list,
@@ -231,7 +262,7 @@ class Repository:
                classification_method=CASE WHEN topics.classification_method='human_override' THEN topics.classification_method ELSE excluded.classification_method END,
                classification_reason=CASE WHEN topics.classification_method='human_override' THEN topics.classification_reason ELSE excluded.classification_reason END,
                taxonomy_version=CASE WHEN topics.classification_method='human_override' THEN topics.taxonomy_version ELSE excluded.taxonomy_version END,
-               last_seen_at=excluded.last_seen_at, updated_at=excluded.updated_at""",
+               first_seen_at=MIN(topics.first_seen_at, excluded.first_seen_at), last_seen_at=MAX(topics.last_seen_at, excluded.last_seen_at), updated_at=excluded.updated_at""",
             (topic_id, title, primary_category, json.dumps(secondary_categories), reason, taxonomy_version,
              first_seen, last_seen, utc_now().isoformat()),
         )
@@ -257,7 +288,7 @@ class Repository:
                 (topic_id, primary_category, json.dumps(secondary_categories), reason, taxonomy_version, reviewer.strip(), now),
             )
 
-    def save_topic_window(self, topic_id: str, window_start: str, window_end: str, metrics: dict) -> None:
+    def save_topic_window(self, topic_id: str, window_start: str, window_end: str, metrics: dict, commit: bool = True) -> None:
         self.connection.execute(
             """INSERT INTO topic_windows (topic_id, window_start, window_end, post_count, capped_contributions,
                author_count, family_count, hhi, baseline, score, stage, components)
@@ -270,7 +301,8 @@ class Repository:
              metrics["HHI"], metrics["baseline"], metrics["score"], metrics["stage"],
              json.dumps(metrics["components"])),
         )
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
 
     def latest_topic_metrics(self, topic_id: str):
         return self.connection.execute(
@@ -278,12 +310,25 @@ class Repository:
         ).fetchone()
 
     def save_alert(self, topic_id: str, analysis_mode: str, recommendation: str, payload: dict) -> int:
+        window = payload.get("analysis_window") or {}
+        version = payload.get("metrics_version")
+        key = payload.get("analysis_key")
+        now = payload.setdefault("created_at", utc_now().isoformat())
+        payload.setdefault("review_status", "pending")
         result = self.connection.execute(
-            "INSERT INTO alerts (topic_id, analysis_mode, recommendation, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-            (topic_id, analysis_mode, recommendation, json.dumps(payload, ensure_ascii=False), utc_now().isoformat()),
+            """INSERT OR IGNORE INTO alerts (topic_id, analysis_mode, recommendation, payload, created_at,
+               window_start, window_end, metrics_version, analysis_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (topic_id, analysis_mode, recommendation, json.dumps(payload, ensure_ascii=False), now,
+             window.get("start"), window.get("end"), version, key),
         )
         self.connection.commit()
+        if key:
+            return int(self.connection.execute("SELECT id FROM alerts WHERE analysis_key=?", (key,)).fetchone()[0])
         return int(result.lastrowid)
+
+    def cached_alert(self, key: str):
+        row = self.connection.execute("SELECT payload FROM alerts WHERE analysis_key=? OR analysis_key LIKE ? ORDER BY id DESC LIMIT 1", (key, key + ":retry:%")).fetchone()
+        return json.loads(row[0]) if row else None
 
     def save_review(self, alert_id: int, decision: str, revised_summary: Optional[str], reviewer: str) -> int:
         if decision not in {"APPROVE", "REJECT", "EDIT"}:
@@ -301,13 +346,13 @@ class Repository:
         return self.connection.execute(
             """SELECT t.topic_id, t.title, t.primary_category, t.secondary_categories, t.updated_at,
                 w.post_count, w.capped_contributions, w.author_count, w.family_count, w.hhi, w.baseline,
-                w.score, w.stage, w.components, a.id AS alert_id, a.recommendation, a.analysis_mode, a.payload,
+                w.score, w.stage, w.components, w.window_start, w.window_end, w.metrics_version, w.coverage, w.circulation, a.id AS alert_id, a.recommendation, a.analysis_mode, a.payload,
                 a.created_at AS alert_created_at
                FROM topics t
                JOIN topic_windows w ON w.topic_id=t.topic_id
                JOIN (SELECT topic_id, MAX(window_end) AS newest FROM topic_windows GROUP BY topic_id) newest
                     ON newest.topic_id=w.topic_id AND newest.newest=w.window_end
-               LEFT JOIN alerts a ON a.id=(SELECT id FROM alerts ax WHERE ax.topic_id=t.topic_id ORDER BY ax.id DESC LIMIT 1)
+               LEFT JOIN alerts a ON a.id=(SELECT id FROM alerts ax WHERE ax.topic_id=t.topic_id AND ax.window_start=w.window_start AND ax.window_end=w.window_end AND ax.metrics_version=w.metrics_version ORDER BY ax.id DESC LIMIT 1)
                ORDER BY COALESCE(w.score, -1) DESC, t.title"""
         ).fetchall()
 
@@ -320,3 +365,43 @@ class Repository:
         return self.connection.execute(
             "SELECT source_key, finished_at, status, pages, inserted_posts, coverage, error FROM collection_runs ORDER BY id DESC LIMIT 1"
         ).fetchone()
+
+
+    def coverage_between(self, start: str, end: str) -> dict:
+        from app.models import parse_utc
+        runs = self.connection.execute("SELECT source_key, coverage FROM collection_runs WHERE status='success' ORDER BY id DESC").fetchall()
+        intervals = []
+        for row in runs:
+            coverage = json.loads(row["coverage"] or "{}")
+            if coverage.get("complete") and coverage.get("kind") == "synthetic_local_jsonl":
+                intervals.append((parse_utc(coverage["complete_start"]), parse_utc(coverage["complete_end"]), row["source_key"]))
+        cursor, stop = parse_utc(start), parse_utc(end)
+        sources = set()
+        for left, right, source in sorted(intervals):
+            if left <= cursor < right:
+                cursor = max(cursor, right)
+                sources.add(source)
+        return {"start": start, "end": end, "complete": cursor >= stop,
+                "source_keys": sorted(sources), "basis": "verified_synthetic_fixture" if cursor >= stop else "unknown_or_partial"}
+
+    def save_snapshot(self, topic_id, start, end, metrics, evidence):
+        serialized = json.dumps({"metrics": metrics, "evidence": evidence}, sort_keys=True, ensure_ascii=False)
+        fingerprint = hashlib.sha256(serialized.encode()).hexdigest()
+        with self.transaction() as connection:
+            latest = connection.execute("SELECT version, fingerprint FROM topic_snapshots WHERE topic_id=? AND window_start=? AND window_end=? ORDER BY version DESC LIMIT 1", (topic_id, start, end)).fetchone()
+            version = latest["version"] if latest and latest["fingerprint"] == fingerprint else (latest["version"] + 1 if latest else 1)
+            self.save_topic_window(topic_id, start, end, metrics, commit=False)
+            connection.execute("INSERT OR IGNORE INTO topic_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                               (topic_id, start, end, version, fingerprint, json.dumps(metrics), json.dumps(evidence, ensure_ascii=False), utc_now().isoformat()))
+            connection.execute("UPDATE topic_windows SET metrics_version=?, coverage=?, circulation=? WHERE topic_id=? AND window_start=? AND window_end=?",
+                               (version, json.dumps(metrics["coverage"]), json.dumps(metrics["circulation"]), topic_id, start, end))
+        return version
+
+    def snapshot(self, topic_id, start, end, version):
+        return self.connection.execute("SELECT * FROM topic_snapshots WHERE topic_id=? AND window_start=? AND window_end=? AND version=?", (topic_id, start, end, version)).fetchone()
+
+    def log_agent_call(self, topic, name, arguments, refs):
+        window = topic.get("analysis_window") or {}
+        self.connection.execute("INSERT INTO agent_calls (topic_id, window_end, metrics_version, tool_name, arguments, evidence_refs, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                (topic["topic_id"], window.get("end"), topic.get("metrics_version"), name, json.dumps(arguments), json.dumps(refs), utc_now().isoformat()))
+        self.connection.commit()

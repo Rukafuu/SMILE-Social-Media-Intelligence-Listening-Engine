@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 
-SUPPORTED_KEYS = {"OPENROUTER_API_KEY", "OPENROUTER_MODEL", "MASTODON_BASE_URL", "MASTODON_TOKEN",
+SUPPORTED_KEYS = {"SMILE_DATABASE", "CRYPTOBR_DATABASE", "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "MASTODON_BASE_URL", "MASTODON_TOKEN",
                   "MASTODON_CLIENT_ID", "MASTODON_CLIENT_SECRET", "MASTODON_AUTHORIZATION_CODE",
                   "MASTODON_REDIRECT_URI"}
 
@@ -41,3 +41,4 @@ def upsert_local_env_value(key: str, value: str, path: str = ".env", remove_keys
     replaced.append(key + "=" + value)
     env_file.write_text("\n".join(replaced) + "\n", encoding="utf-8")
     env_file.chmod(0o600)
+

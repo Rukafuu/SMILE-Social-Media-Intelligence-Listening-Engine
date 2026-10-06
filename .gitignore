@@ -5,3 +5,10 @@ __pycache__/
 data/*.sqlite3
 data/*.jsonl
 
+
+
+data/*.sqlite
+data/*.sqlite3-*
+data/*.sqlite-*
+data/*.jsonl.meta.json
+.pytest_cache/
