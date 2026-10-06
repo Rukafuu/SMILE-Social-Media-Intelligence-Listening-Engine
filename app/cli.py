@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime
 
-from app.collectors import LocalJsonlFeed, collect_all
+from app.collectors import LocalJsonlFeed, MastodonHashtagFeed, collect_all
 from app.repository import Repository
 from app.trends import analyze
 from app.agent import AgentError, analyze_topic
@@ -14,11 +15,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="cryptobr")
     subparsers = parser.add_subparsers(dest="command", required=True)
     collect = subparsers.add_parser("collect", help="collect the paged local feed")
+    collect.add_argument("--source", choices=["local", "mastodon"], default="local")
     collect.add_argument("--feed", default="data/synthetic_feed.jsonl")
     collect.add_argument("--database", default="data/cryptobr.sqlite3")
     collect.add_argument("--page-size", type=int, default=50)
     collect.add_argument("--simulate-transient-error", action="store_true")
-    collect.add_argument("--source-key", default="local:synthetic:v1")
+    collect.add_argument("--source-key")
+    collect.add_argument("--reopen-exhausted", action="store_true", help="poll an exhausted local feed for appended records")
+    collect.add_argument("--hashtag", help="Mastodon hashtag (without #)")
+    collect.add_argument("--mastodon-base-url", default=os.getenv("MASTODON_BASE_URL"))
     analyze_command = subparsers.add_parser("analyze", help="associate events and calculate trend scores")
     analyze_command.add_argument("--database", default="data/cryptobr.sqlite3")
     analyze_command.add_argument("--as-of", required=True)
@@ -34,8 +39,17 @@ def main() -> None:
         repository = Repository(args.database)
         repository.initialize()
         try:
-            feed = LocalJsonlFeed(args.feed, args.page_size, 2 if args.simulate_transient_error else None)
-            print(json.dumps(collect_all(repository, feed, args.source_key), ensure_ascii=False))
+            if args.source == "local":
+                feed = LocalJsonlFeed(args.feed, args.page_size, 2 if args.simulate_transient_error else None)
+                source_key = args.source_key or "local:synthetic:v1"
+                query = "all"
+            else:
+                if not args.hashtag:
+                    parser.error("--hashtag is required for --source mastodon")
+                feed = MastodonHashtagFeed(args.mastodon_base_url, os.getenv("MASTODON_TOKEN"), args.page_size)
+                source_key = args.source_key or "mastodon:%s:%s" % (args.mastodon_base_url, args.hashtag.casefold())
+                query = args.hashtag
+            print(json.dumps(collect_all(repository, feed, source_key, query=query, reopen_exhausted=args.reopen_exhausted), ensure_ascii=False))
         finally:
             repository.close()
     if args.command == "analyze":

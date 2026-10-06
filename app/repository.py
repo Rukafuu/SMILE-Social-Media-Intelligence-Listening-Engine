@@ -59,6 +59,7 @@ class Repository:
                 status TEXT NOT NULL,
                 pages INTEGER NOT NULL DEFAULT 0,
                 inserted_posts INTEGER NOT NULL DEFAULT 0,
+                coverage TEXT,
                 error TEXT
             );
             CREATE TABLE IF NOT EXISTS invalid_records (
@@ -115,6 +116,10 @@ class Repository:
             );
             """
         )
+        # Compatible migration for SQLite databases created by earlier MVP steps.
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(collection_runs)")}
+        if "coverage" not in columns:
+            self.connection.execute("ALTER TABLE collection_runs ADD COLUMN coverage TEXT")
         self.connection.commit()
 
     @contextmanager
@@ -139,10 +144,11 @@ class Repository:
         self.connection.commit()
         return int(cursor.lastrowid)
 
-    def finish_run(self, run_id: int, status: str, pages: int, inserted: int, error: Optional[str] = None) -> None:
+    def finish_run(self, run_id: int, status: str, pages: int, inserted: int, error: Optional[str] = None,
+                   coverage: Optional[dict] = None) -> None:
         self.connection.execute(
-            "UPDATE collection_runs SET finished_at=?, status=?, pages=?, inserted_posts=?, error=? WHERE id=?",
-            (utc_now().isoformat(), status, pages, inserted, error, run_id),
+            "UPDATE collection_runs SET finished_at=?, status=?, pages=?, inserted_posts=?, coverage=?, error=? WHERE id=?",
+            (utc_now().isoformat(), status, pages, inserted, json.dumps(coverage or {}), error, run_id),
         )
         self.connection.commit()
 
@@ -260,3 +266,8 @@ class Repository:
         return self.connection.execute(
             "SELECT decision, revised_summary, reviewer, created_at FROM reviews WHERE alert_id=? ORDER BY id DESC", (alert_id,)
         ).fetchall()
+
+    def latest_collection_run(self):
+        return self.connection.execute(
+            "SELECT source_key, finished_at, status, pages, inserted_posts, coverage, error FROM collection_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()

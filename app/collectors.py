@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 import json
+import os
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +19,26 @@ from app.repository import Repository
 
 class TransientCollectionError(RuntimeError):
     pass
+
+
+class SourceAccessError(RuntimeError):
+    """The source rejected access; retrying cannot repair credentials or policy."""
+    pass
+
+
+class _TextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+
+def strip_html(content: str) -> str:
+    extractor = _TextExtractor()
+    extractor.feed(content or "")
+    return " ".join("".join(extractor.parts).split())
 
 
 @dataclass
@@ -42,18 +67,101 @@ class LocalJsonlFeed:
         items = records[start:start + self.page_size]
         end = start + len(items)
         exhausted = end >= len(records)
-        return Page(items, None if exhausted else str(end), exhausted,
-                    {"kind": "synthetic_local_jsonl", "total_available": len(records), "query": query})
+        # Retain the numeric position even at exhaustion. If a later source poll
+        # exposes newly appended records, the collector can continue safely.
+        timestamps = [record.get("timestamp") for record in records if record.get("timestamp")]
+        return Page(items, str(end), exhausted,
+                    {"kind": "synthetic_local_jsonl", "total_available": len(records), "query": query,
+                     "earliest_published_at": min(timestamps) if timestamps else None,
+                     "latest_published_at": max(timestamps) if timestamps else None})
 
 
-def collect_all(repository: Repository, feed: LocalJsonlFeed, source_key: str, query: str = "all", max_retries: int = 3) -> Dict[str, Any]:
+class MastodonHashtagFeed:
+    """Permitted API connector for a single Mastodon instance and hashtag.
+
+    It intentionally makes no claim of global social coverage. The collector
+    uses API-provided cursors and never scrapes HTML or bypasses access gates.
+    """
+    def __init__(self, base_url: str, token: Optional[str] = None, limit: int = 40) -> None:
+        if not base_url:
+            raise ValueError("MASTODON_BASE_URL is required for the Mastodon connector")
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.limit = min(max(limit, 1), 40)
+
+    def fetch_page(self, query: str, cursor: Optional[str]) -> Page:
+        hashtag = query.lstrip("#").strip()
+        if not hashtag:
+            raise ValueError("a Mastodon hashtag is required")
+        params = {"limit": str(self.limit)}
+        if cursor:
+            params["max_id"] = cursor
+        url = "%s/api/v1/timelines/tag/%s?%s" % (
+            self.base_url, urllib.parse.quote(hashtag, safe=""), urllib.parse.urlencode(params)
+        )
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                statuses = json.loads(response.read().decode("utf-8"))
+                link_header = response.headers.get("Link", "")
+        except urllib.error.HTTPError as error:
+            if error.code in (401, 403):
+                raise SourceAccessError("Mastodon access denied (%s); check instance policy or token" % error.code) from error
+            if error.code == 429 or 500 <= error.code <= 599:
+                raise TransientCollectionError("Mastodon transient HTTP error %s" % error.code) from error
+            raise RuntimeError("Mastodon HTTP error %s" % error.code) from error
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise TransientCollectionError("Mastodon transport error") from error
+        next_cursor = self._next_cursor(link_header)
+        items = [self._normalize(status) for status in statuses]
+        exhausted = not bool(next_cursor)
+        timestamps = [item["timestamp"] for item in items]
+        return Page(items, next_cursor, exhausted, {
+            "kind": "mastodon_hashtag", "instance": self.base_url, "hashtag": hashtag,
+            "returned_items": len(items), "earliest_published_at": min(timestamps) if timestamps else None,
+            "latest_published_at": max(timestamps) if timestamps else None,
+        })
+
+    @staticmethod
+    def _next_cursor(link_header: str) -> Optional[str]:
+        for section in link_header.split(","):
+            if 'rel="next"' not in section:
+                continue
+            if "<" not in section or ">" not in section:
+                continue
+            url = section.split("<", 1)[1].split(">", 1)[0]
+            value = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("max_id", [None])[0]
+            if value:
+                return value
+        return None
+
+    @staticmethod
+    def _normalize(status: Dict[str, Any]) -> Dict[str, Any]:
+        account = status.get("account") or {}
+        return {
+            "post_id": str(status["id"]), "platform": "mastodon",
+            "timestamp": status["created_at"], "content": strip_html(status.get("content", "")),
+            "author_id": "mastodon:%s" % account.get("id", "unknown"),
+            "source_url": status.get("url") or status.get("uri") or "mastodon://" + str(status["id"]),
+            "canonical_uri": status.get("uri"), "repost_of": str(status["reblog"]["id"]) if status.get("reblog") else None,
+            "likes": status.get("favourites_count"), "comments": status.get("replies_count"),
+            "reposts": status.get("reblogs_count"), "views": None, "is_synthetic": False,
+        }
+
+
+def collect_all(repository: Repository, feed: LocalJsonlFeed, source_key: str, query: str = "all", max_retries: int = 3,
+                reopen_exhausted: bool = False) -> Dict[str, Any]:
     checkpoint = repository.get_checkpoint(source_key)
-    if checkpoint and checkpoint["exhausted"]:
+    if checkpoint and checkpoint["exhausted"] and not reopen_exhausted:
         return {"status": "already_exhausted", "pages": 0, "inserted": 0, "post_count": repository.post_count()}
     cursor = checkpoint["cursor"] if checkpoint else None
     seen_cursors = set()
     run_id = repository.start_run(source_key)
     pages = inserted = 0
+    coverage = {}
     try:
         while True:
             if cursor in seen_cursors:
@@ -80,11 +188,12 @@ def collect_all(repository: Repository, feed: LocalJsonlFeed, source_key: str, q
                     repository.record_invalid(source_key, cursor, item, str(error))
             inserted += repository.persist_page(source_key, page.next_cursor, page.exhausted, valid_posts)
             pages += 1
+            coverage = page.coverage
             if page.exhausted:
                 break
             cursor = page.next_cursor
-        repository.finish_run(run_id, "success", pages, inserted)
+        repository.finish_run(run_id, "success", pages, inserted, coverage=coverage)
         return {"status": "success", "pages": pages, "inserted": inserted, "post_count": repository.post_count()}
     except Exception as error:
-        repository.finish_run(run_id, "failed", pages, inserted, str(error))
+        repository.finish_run(run_id, "failed", pages, inserted, str(error), coverage)
         raise

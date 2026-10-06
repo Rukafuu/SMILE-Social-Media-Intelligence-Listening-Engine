@@ -34,9 +34,11 @@ Python 3.9 do ambiente local, para permitir validação antes da atualização d
 runtime.
 
 ```bash
-python3 scripts/generate_dataset.py --seed 42 --as-of 2026-10-06T15:00:00Z
+python3 scripts/generate_dataset.py --seed 42 --as-of 2026-10-06T15:00:00Z --batch initial
 python3 -m app.cli collect --simulate-transient-error
-python3 -m app.cli analyze --as-of 2026-10-06T15:00:00Z
+python3 -m app.cli analyze --as-of 2026-10-06T14:45:00Z
+python3 scripts/generate_dataset.py --seed 42 --as-of 2026-10-06T15:00:00Z --batch update --append
+python3 -m app.cli collect --reopen-exhausted
 OPENROUTER_API_KEY='...' python3 -m app.cli analyze --as-of 2026-10-06T15:00:00Z --with-agent
 streamlit run dashboard.py
 python3 -m unittest discover -s tests -v
@@ -44,6 +46,25 @@ python3 -m unittest discover -s tests -v
 
 A segunda execução de `collect` reporta `already_exhausted` e preserva a mesma
 contagem de posts. Os arquivos gerados ficam em `data/` e não são versionados.
+
+O comando `--reopen-exhausted` é reservado ao polling da mesma fonte depois de
+ela receber registros anexados: retoma da posição de cursor persistida e não
+reconta os posts anteriores. A coleta registra no SQLite a cobertura declarada
+pela fonte, exibida no painel.
+
+### Fonte externa opcional: Mastodon
+
+O conector usa somente a API permitida de uma instância e uma hashtag; ele não
+representa cobertura global. Defina `MASTODON_BASE_URL` e, se a instância exigir,
+`MASTODON_TOKEN`, então execute:
+
+```bash
+python3 -m app.cli collect --source mastodon --hashtag crypto
+```
+
+Erros `401` e `403` param a coleta para correção de acesso; `429`, `5xx` e erros
+de transporte usam o retry limitado. Não há scraping HTML nem tentativa de
+contornar login, rate limits ou políticas da instância.
 
 ## Limites atuais
 

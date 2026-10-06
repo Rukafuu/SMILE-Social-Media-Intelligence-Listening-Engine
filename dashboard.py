@@ -22,6 +22,15 @@ def main():
     st.title("CryptoBR Social Intelligence")
     st.caption("Protótipo local — todos os posts e alegações exibidos nesta instância são sintéticos.")
     store = repository()
+    collection = store.latest_collection_run()
+    if collection:
+        coverage = json.loads(collection["coverage"] or "{}")
+        st.sidebar.subheader("Coleta")
+        st.sidebar.caption("Estado: %s · %s" % (collection["status"], collection["finished_at"] or "em andamento"))
+        st.sidebar.caption("Posts inseridos: %s · Páginas: %s" % (collection["inserted_posts"], collection["pages"]))
+        st.sidebar.caption("Cobertura: " + coverage.get("kind", "não informada"))
+        if coverage.get("earliest_published_at"):
+            st.sidebar.caption("Publicações: %s → %s" % (coverage["earliest_published_at"], coverage["latest_published_at"]))
     rows = store.dashboard_topics()
     if not rows:
         st.info("Ainda não há análise. Gere o dataset, colete e execute `python -m app.cli analyze --with-agent`.")
