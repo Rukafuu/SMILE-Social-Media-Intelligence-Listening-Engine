@@ -104,6 +104,15 @@ class Repository:
                 payload TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS reviews (
+                id INTEGER PRIMARY KEY,
+                alert_id INTEGER NOT NULL REFERENCES alerts(id),
+                decision TEXT NOT NULL CHECK(decision IN ('APPROVE', 'REJECT', 'EDIT')),
+                revised_summary TEXT,
+                reviewer TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(alert_id, decision, reviewer, created_at)
+            );
             """
         )
         self.connection.commit()
@@ -220,3 +229,34 @@ class Repository:
         )
         self.connection.commit()
         return int(result.lastrowid)
+
+    def save_review(self, alert_id: int, decision: str, revised_summary: Optional[str], reviewer: str) -> int:
+        if decision not in {"APPROVE", "REJECT", "EDIT"}:
+            raise ValueError("invalid review decision")
+        if not reviewer.strip():
+            raise ValueError("reviewer is required")
+        result = self.connection.execute(
+            "INSERT INTO reviews (alert_id, decision, revised_summary, reviewer, created_at) VALUES (?, ?, ?, ?, ?)",
+            (alert_id, decision, revised_summary or None, reviewer.strip(), utc_now().isoformat()),
+        )
+        self.connection.commit()
+        return int(result.lastrowid)
+
+    def dashboard_topics(self):
+        return self.connection.execute(
+            """SELECT t.topic_id, t.title, t.primary_category, t.secondary_categories, t.updated_at,
+                w.post_count, w.capped_contributions, w.author_count, w.family_count, w.hhi, w.baseline,
+                w.score, w.stage, w.components, a.id AS alert_id, a.recommendation, a.analysis_mode, a.payload,
+                a.created_at AS alert_created_at
+               FROM topics t
+               JOIN topic_windows w ON w.topic_id=t.topic_id
+               JOIN (SELECT topic_id, MAX(window_end) AS newest FROM topic_windows GROUP BY topic_id) newest
+                    ON newest.topic_id=w.topic_id AND newest.newest=w.window_end
+               LEFT JOIN alerts a ON a.id=(SELECT id FROM alerts ax WHERE ax.topic_id=t.topic_id ORDER BY ax.id DESC LIMIT 1)
+               ORDER BY COALESCE(w.score, -1) DESC, t.title"""
+        ).fetchall()
+
+    def reviews_for_alert(self, alert_id: int):
+        return self.connection.execute(
+            "SELECT decision, revised_summary, reviewer, created_at FROM reviews WHERE alert_id=? ORDER BY id DESC", (alert_id,)
+        ).fetchall()

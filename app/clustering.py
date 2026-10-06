@@ -17,8 +17,11 @@ RULES = (
     ("bitcoin-etf-stable", "Bitcoin permanece estável após sessão de ETFs fictícios", ("bitcoin", "etf")),
     ("regulator-crypto-etf", "Regulador fictício aprova consulta sobre ETF cripto", ("regulador", "etf")),
     ("exchange-aurora-listing", "Exchange Aurora anuncia listagem fictícia", ("exchange aurora", "listagem")),
+    ("exchange-aurora-incident", "Exchange Aurora sofre incidente fictício", ("exchange aurora", "incidente")),
     ("horizonte-crypto-sponsorship", "Clube Horizonte fecha patrocínio cripto fictício", ("clube horizonte", "patrocínio")),
     ("market-rates-crypto-etf", "Mercado debate juros e ETF cripto fictício", ("mercado", "juros", "etf")),
+    ("novachain-audit-rumor", "Rumor sobre auditoria da NovaChain", ("novachain", "auditoria")),
+    ("old-orbit-announcement", "Anúncio antigo da Orbit recircula", ("orbit", "anúncio antigo")),
 )
 
 

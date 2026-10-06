@@ -17,6 +17,12 @@ O primeiro incremento cobre a base de ingestão:
 - classificação em, no máximo, cinco categorias configuradas;
 - janelas de quinze minutos, baseline de três janelas e score de tendência
   com componentes, HHI, estágio e ranking persistidos.
+- cenários sintéticos para cópias, rumor de fonte única, negação, evento antigo
+  recirculado, incidente/listagem separados e conteúdo de prompt injection;
+- critic determinístico que limita destaques sem referência válida e mantém
+  rumores de origem única em monitoramento.
+- console administrativo Streamlit com filtro por categoria, ranking, métricas,
+  incertezas/riscos e histórico persistente de revisão humana.
 
 O agente, alertas/revisões e painel administrativo ainda serão implementados
 nos próximos incrementos.
@@ -32,6 +38,7 @@ python3 scripts/generate_dataset.py --seed 42 --as-of 2026-10-06T15:00:00Z
 python3 -m app.cli collect --simulate-transient-error
 python3 -m app.cli analyze --as-of 2026-10-06T15:00:00Z
 OPENROUTER_API_KEY='...' python3 -m app.cli analyze --as-of 2026-10-06T15:00:00Z --with-agent
+streamlit run dashboard.py
 python3 -m unittest discover -s tests -v
 ```
 
@@ -51,3 +58,16 @@ Defina `OPENROUTER_API_KEY` no ambiente e, opcionalmente,
 ferramenta e pode consultar somente métricas e até oito evidências locais do
 tópico sob análise. Sem chave, ele gera uma sugestão explicitamente marcada
 como `simulated`; falhas do provedor ficam marcadas como `unavailable`.
+
+## Revisão humana
+
+O painel permite aprovar, rejeitar ou editar uma sugestão sem apagar a saída
+automática. Também é possível registrar uma decisão pelo CLI:
+
+```bash
+python3 -m app.cli review --alert-id 1 --decision EDIT --reviewer ana --summary "Resumo revisado"
+```
+
+As expectativas do dataset ficam separadas em
+[`config/scenario_expectations.json`](config/scenario_expectations.json), para
+que os rótulos de cenário nunca sejam entrada do agrupador.

@@ -23,6 +23,12 @@ def main() -> None:
     analyze_command.add_argument("--database", default="data/cryptobr.sqlite3")
     analyze_command.add_argument("--as-of", required=True)
     analyze_command.add_argument("--with-agent", action="store_true", help="create bounded analysis suggestions")
+    review = subparsers.add_parser("review", help="record a human decision for an alert")
+    review.add_argument("--database", default="data/cryptobr.sqlite3")
+    review.add_argument("--alert-id", type=int, required=True)
+    review.add_argument("--decision", choices=["APPROVE", "REJECT", "EDIT"], required=True)
+    review.add_argument("--reviewer", required=True)
+    review.add_argument("--summary")
     args = parser.parse_args()
     if args.command == "collect":
         repository = Repository(args.database)
@@ -47,6 +53,14 @@ def main() -> None:
                     topic["agent"] = alert
                     repository.save_alert(topic["topic_id"], alert["analysis_mode"], alert["recommendation"], alert)
             print(json.dumps(results, ensure_ascii=False, indent=2))
+        finally:
+            repository.close()
+    if args.command == "review":
+        repository = Repository(args.database)
+        repository.initialize()
+        try:
+            review_id = repository.save_review(args.alert_id, args.decision, args.summary, args.reviewer)
+            print(json.dumps({"status": "saved", "review_id": review_id, "alert_id": args.alert_id}, ensure_ascii=False))
         finally:
             repository.close()
 
